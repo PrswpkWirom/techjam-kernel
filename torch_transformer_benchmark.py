@@ -183,13 +183,19 @@ class UserOptimizedTransformer(BaselineTransformer):
       3. Keep compatible parameter names, or customize copy_model_weights().
     """
 
+    # Manually select the attention implementation here. The selected class must
+    # accept (d_model, num_heads) and expose baseline-compatible parameters.
+    attention_class = TritonSelfAttention
+
     def __init__(self, config: TransformerConfig) -> None:
         super().__init__(config)
 
         # Attention is the only adapter changed in this iteration. The block,
         # FFN, norms, and state-dict paths remain exactly those of the baseline.
         for layer in self.layers:
-            layer.attention = TritonSelfAttention(config.d_model, config.num_heads)
+            layer.attention = self.attention_class(
+                config.d_model, config.num_heads
+            )
 
 
 def copy_model_weights(
