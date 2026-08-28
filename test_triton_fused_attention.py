@@ -6,6 +6,7 @@ import unittest
 import torch
 
 from triton_fused_attention import TritonFusedSelfAttention, triton_fused_attention
+from triton_softmax import TritonSelfAttention, triton_attention_softmax
 
 
 def _reference_attention(
@@ -30,6 +31,24 @@ def _reference_attention(
     return torch.matmul(probabilities, v)
 
 
+def _triton_softmax_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    valid_token_mask: torch.Tensor | None,
+    causal: bool,
+) -> torch.Tensor:
+    """Run the materialized QK -> Triton softmax -> PV comparison path."""
+    scores = torch.matmul(q, k.transpose(-2, -1))
+    probabilities = triton_attention_softmax(
+        scores,
+        valid_token_mask=valid_token_mask,
+        causal=causal,
+        scale=q.shape[-1] ** -0.5,
+    )
+    return torch.matmul(probabilities, v)
+
+
 def _assert_official_tolerance(
     candidate: torch.Tensor, reference: torch.Tensor
 ) -> None:
@@ -49,6 +68,30 @@ def _assert_official_tolerance(
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires a CUDA device")
 class TritonFusedAttentionTests(unittest.TestCase):
+    def _assert_attention_implementations(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        valid_token_mask: torch.Tensor | None,
+        causal: bool,
+    ) -> None:
+        expected = _reference_attention(q, k, v, valid_token_mask, causal)
+        softmax_actual = _triton_softmax_attention(
+            q, k, v, valid_token_mask, causal
+        )
+        fused_actual = triton_fused_attention(
+            q,
+            k,
+            v,
+            valid_token_mask=valid_token_mask,
+            causal=causal,
+            scale=1.0 / math.sqrt(q.shape[-1]),
+        )
+
+        _assert_official_tolerance(softmax_actual, expected)
+        _assert_official_tolerance(fused_actual, expected)
+
     def test_noncausal_attention_without_padding(self) -> None:
         generator = torch.Generator(device="cuda").manual_seed(1234)
         q = torch.randn(
@@ -60,17 +103,9 @@ class TritonFusedAttentionTests(unittest.TestCase):
         k = torch.randn_like(q)
         v = torch.randn_like(q)
 
-        expected = _reference_attention(q, k, v, None, causal=False)
-        actual = triton_fused_attention(
-            q,
-            k,
-            v,
-            valid_token_mask=None,
-            causal=False,
-            scale=1.0 / math.sqrt(q.shape[-1]),
+        self._assert_attention_implementations(
+            q, k, v, valid_token_mask=None, causal=False
         )
-
-        _assert_official_tolerance(actual, expected)
 
     def test_causal_attention_with_padding_and_partial_tiles(self) -> None:
         generator = torch.Generator(device="cuda").manual_seed(5678)
@@ -87,19 +122,9 @@ class TritonFusedAttentionTests(unittest.TestCase):
             [97, 71, 19], device="cuda"
         )[:, None]
 
-        expected = _reference_attention(
-            q, k, v, valid_token_mask, causal=True
+        self._assert_attention_implementations(
+            q, k, v, valid_token_mask=valid_token_mask, causal=True
         )
-        actual = triton_fused_attention(
-            q,
-            k,
-            v,
-            valid_token_mask=valid_token_mask,
-            causal=True,
-            scale=1.0 / math.sqrt(q.shape[-1]),
-        )
-
-        _assert_official_tolerance(actual, expected)
 
     def test_single_token_causal_attention(self) -> None:
         q = torch.randn((1, 1, 1, 32), device="cuda", dtype=torch.float16)
@@ -107,34 +132,18 @@ class TritonFusedAttentionTests(unittest.TestCase):
         v = torch.randn_like(q)
         valid_token_mask = torch.ones((1, 1), device="cuda", dtype=torch.bool)
 
-        expected = _reference_attention(
-            q, k, v, valid_token_mask, causal=True
+        self._assert_attention_implementations(
+            q, k, v, valid_token_mask=valid_token_mask, causal=True
         )
-        actual = triton_fused_attention(
-            q,
-            k,
-            v,
-            valid_token_mask=valid_token_mask,
-            causal=True,
-        )
-
-        _assert_official_tolerance(actual, expected)
 
     def test_causal_attention_without_padding_mask(self) -> None:
         q = torch.randn((2, 2, 65, 64), device="cuda", dtype=torch.float16)
         k = torch.randn_like(q)
         v = torch.randn_like(q)
 
-        expected = _reference_attention(q, k, v, None, causal=True)
-        actual = triton_fused_attention(
-            q,
-            k,
-            v,
-            valid_token_mask=None,
-            causal=True,
+        self._assert_attention_implementations(
+            q, k, v, valid_token_mask=None, causal=True
         )
-
-        _assert_official_tolerance(actual, expected)
 
     def test_bfloat16_attention_with_partial_tiles(self) -> None:
         q = torch.randn((2, 3, 33, 32), device="cuda", dtype=torch.bfloat16)
@@ -144,27 +153,22 @@ class TritonFusedAttentionTests(unittest.TestCase):
             [33, 11], device="cuda"
         )[:, None]
 
-        expected = _reference_attention(
-            q, k, v, valid_token_mask, causal=False
-        )
-        actual = triton_fused_attention(
-            q,
-            k,
-            v,
-            valid_token_mask=valid_token_mask,
-            causal=False,
+        self._assert_attention_implementations(
+            q, k, v, valid_token_mask=valid_token_mask, causal=False
         )
 
-        _assert_official_tolerance(actual, expected)
-
-    def test_module_loads_baseline_weights_and_zeroes_padded_queries(self) -> None:
+    def test_modules_load_baseline_weights_and_zero_padded_queries(self) -> None:
         from torch_transformer_benchmark import BaselineSelfAttention
 
         torch.manual_seed(9012)
         baseline = BaselineSelfAttention(d_model=128, num_heads=2)
+        softmax_attention = TritonSelfAttention(d_model=128, num_heads=2)
         fused = TritonFusedSelfAttention(d_model=128, num_heads=2)
-        fused.load_state_dict(baseline.state_dict(), strict=True)
+        state_dict = baseline.state_dict()
+        softmax_attention.load_state_dict(state_dict, strict=True)
+        fused.load_state_dict(state_dict, strict=True)
         baseline = baseline.cuda().half().eval()
+        softmax_attention = softmax_attention.cuda().half().eval()
         fused = fused.cuda().half().eval()
         x = torch.randn((2, 33, 128), device="cuda", dtype=torch.float16)
         valid_token_mask = torch.arange(33, device="cuda")[None, :] < torch.tensor(
@@ -173,10 +177,15 @@ class TritonFusedAttentionTests(unittest.TestCase):
 
         with torch.inference_mode():
             expected = baseline(x, valid_token_mask, causal=False)
-            actual = fused(x, valid_token_mask, causal=False)
+            softmax_actual = softmax_attention(
+                x, valid_token_mask, causal=False
+            )
+            fused_actual = fused(x, valid_token_mask, causal=False)
 
-        _assert_official_tolerance(actual, expected)
-        self.assertTrue(bool((actual[1, 17:] == 0).all()))
+        _assert_official_tolerance(softmax_actual, expected)
+        _assert_official_tolerance(fused_actual, expected)
+        self.assertTrue(bool((softmax_actual[1, 17:] == 0).all()))
+        self.assertTrue(bool((fused_actual[1, 17:] == 0).all()))
 
 
 if __name__ == "__main__":

@@ -24,7 +24,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from triton_attention import TritonSelfAttention
+from triton_softmax import TritonSelfAttention
 
 
 @dataclass(frozen=True)
