@@ -1,10 +1,9 @@
-"""Fused inference-only self-attention for the Transformer benchmark.
+"""Experimental fused attention and its correctness-safe model adapter.
 
-The fast path computes tiled QK^T, masking, online softmax, and PV in one
-Triton kernel. It writes only the final [B, H, S, D] context tensor; full score
-and probability tensors are never materialized. Unsupported inputs use the
-value-equivalent PyTorch path so this module remains safe outside benchmark
-shapes.
+The experimental function computes tiled QK^T, masking, online softmax, and PV
+in one Triton kernel. Its small FP16 reduction-order differences can accumulate
+across Transformer layers, so the baseline-compatible class deliberately uses
+the exact materialized Triton-softmax path required by the official benchmark.
 """
 
 from __future__ import annotations
@@ -12,10 +11,11 @@ from __future__ import annotations
 from typing import Optional
 
 import torch
-import torch.nn as nn
 import triton
 import triton.language as tl
 from triton.language.extra import libdevice
+
+from triton_softmax import TritonSelfAttention
 
 
 _SUPPORTED_HEAD_DIMS = (16, 32, 64, 128)
@@ -341,7 +341,12 @@ def triton_fused_attention(
     causal: bool = False,
     scale: Optional[float] = None,
 ) -> torch.Tensor:
-    """Return scaled dot-product self-attention context without [S, S] tensors."""
+    """Run the experimental single-kernel attention implementation.
+
+    This function is useful for isolated kernel experiments, but its tiled
+    reduction order is not numerically safe for the official multi-layer FP16
+    benchmark. Use :class:`TritonFusedSelfAttention` as the model adapter.
+    """
     batch, num_heads, sequence_length, head_dim = _validate_inputs(
         q, k, v, valid_token_mask
     )
@@ -395,32 +400,13 @@ def triton_fused_attention(
     return output
 
 
-class TritonFusedSelfAttention(nn.Module):
-    """Baseline-compatible projections backed by fused Triton attention."""
+class TritonFusedSelfAttention(TritonSelfAttention):
+    """Correctness-safe compatibility adapter for the official benchmark.
 
-    def __init__(self, d_model: int, num_heads: int) -> None:
-        super().__init__()
-        if d_model % num_heads != 0:
-            raise ValueError("d_model must be divisible by num_heads")
-
-        self.d_model = d_model
-        self.num_heads = num_heads
-        self.head_dim = d_model // num_heads
-        self.scale = self.head_dim**-0.5
-
-        # Names intentionally match BaselineSelfAttention for strict=True copies.
-        self.q_proj = nn.Linear(d_model, d_model, bias=True)
-        self.k_proj = nn.Linear(d_model, d_model, bias=True)
-        self.v_proj = nn.Linear(d_model, d_model, bias=True)
-        self.out_proj = nn.Linear(d_model, d_model, bias=True)
-
-    def _split_heads(self, x: torch.Tensor) -> torch.Tensor:
-        batch, sequence_length, _ = x.shape
-        return (
-            x.view(batch, sequence_length, self.num_heads, self.head_dim)
-            .transpose(1, 2)
-            .contiguous()
-        )
+    The name is preserved for manual selection and existing imports. The model
+    path inherits the exact QK -> Triton softmax -> native PV implementation;
+    call :func:`triton_fused_attention` directly for experimental full fusion.
+    """
 
     def forward(
         self,
@@ -429,11 +415,27 @@ class TritonFusedSelfAttention(nn.Module):
         causal: bool = False,
     ) -> torch.Tensor:
         batch, sequence_length, _ = x.shape
+        needs_autograd = torch.is_grad_enabled() and (
+            x.requires_grad
+            or any(parameter.requires_grad for parameter in self.parameters())
+        )
+        mask_is_supported = (
+            valid_token_mask is None or valid_token_mask.is_contiguous()
+        )
+        if (
+            x.device.type == "cuda"
+            and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
+            and sequence_length <= 65536
+            and mask_is_supported
+            and not needs_autograd
+        ):
+            return super().forward(x, valid_token_mask, causal)
+
         q = self._split_heads(self.q_proj(x))
         k = self._split_heads(self.k_proj(x))
         v = self._split_heads(self.v_proj(x))
-
-        context = triton_fused_attention(
+        _validate_inputs(q, k, v, valid_token_mask)
+        context = _reference_attention(
             q,
             k,
             v,
