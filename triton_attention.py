@@ -44,8 +44,9 @@ def _attention_softmax_kernel(
     )
     # The baseline scales in the model dtype, then promotes to fp32 for
     # softmax. Preserve that rounding point before the fp32 reductions.
-    score = (score.to(tl.float32) * scale).to(scores_ptr.dtype.element_ty)
-    score = score.to(tl.float32)
+    score = score*scale
+    # score = (score.to(tl.float32) * scale).to(scores_ptr.dtype.element_ty)
+    # score = score.to(tl.float32)
 
     # Flattened rows vary query first, then head, then batch.
     query_position = row % seq_len
@@ -136,7 +137,12 @@ def triton_attention_softmax(
     # One warp owns a 128-wide row in the default benchmark. Besides avoiding
     # cross-warp reduction overhead, this mirrors PyTorch's persistent-softmax
     # reduction shape closely enough to avoid fp16 branch-point drift.
-    num_warps = 1 if block_size <= 128 else 4
+    if block_size <= 128:
+        num_warps = 1
+    elif block_size <= 1024:
+        num_warps = 4
+    else:
+        num_warps = 8
     row_count = batch * num_heads * query_len
     _attention_softmax_kernel[(row_count,)](
         scores,

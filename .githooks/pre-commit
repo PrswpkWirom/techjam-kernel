@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+
+python3 tools/check_benchmark_integrity.py
