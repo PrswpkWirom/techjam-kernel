@@ -183,6 +183,8 @@ class UserOptimizedTransformer(BaselineTransformer):
       3. Keep compatible parameter names, or customize copy_model_weights().
     """
 
+    from triton_fused_attention import TritonFusedSelfAttention
+
     # Manually select the attention implementation here. The selected class must
     # accept (d_model, num_heads) and expose baseline-compatible parameters.
     attention_class = TritonSelfAttention
