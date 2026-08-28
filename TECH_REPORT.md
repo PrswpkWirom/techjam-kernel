@@ -1,6 +1,6 @@
 # TechJam Transformer Optimization Report
 
-## Correctness-safe fused-attention adapter
+## Historical correctness-safe fused-attention adapter
 
 Date: 2026-08-28
 
@@ -60,3 +60,97 @@ python tools/check_benchmark_integrity.py
 
 Human verification: the user should rerun the validation command on the final
 submitted commit and repeat it for every organizer-announced shape.
+
+## Historical fused QK-softmax precision recovery
+
+Date: 2026-08-29
+
+The one-pass `64x64` online attention path reached a promising invalid speedup
+of 1.405x, but failed 71 of 16,777,216 elements for the pinned six-layer seed.
+Layer-by-layer differential testing showed zero official failures in the first
+two blocks, followed by 1, 2, 35, and 126 failures after blocks three through
+six. The first attention output had no official failures but was already
+non-bit-exact, so residual and FFN operations amplified one-ULP differences.
+
+The retained implementation fuses QK, model-dtype score scaling, masking, and
+the complete-row fp32 softmax in one Triton kernel. It materializes only the
+fp16 probability matrix and delegates PV to native `torch.matmul`, preserving
+the organizer baseline's PV reduction order. A diagnostic proved Triton QK was
+bit-exact; the remaining mismatch came from `tl.sum` reducing an MMA-produced
+layout differently from PyTorch's persistent softmax. An explicit round-to-
+nearest `32 -> 16 -> 8 -> 4 -> 2 -> 1` denominator tree made probabilities and
+the complete six-layer output bit-exact. `BLOCK_M=32` and four warps was the
+fastest low-register-pressure exact configuration in the local sweep.
+
+Rejected experiments:
+
+- changing the original online kernel from `BLOCK_N=64` to 128 reduced the
+  final failures from 71 to 16 but did not pass;
+- fused QK-softmax with native PV but generic `tl.sum` reduced failures to 10;
+- storing and reloading scores inside the same kernel regressed to 14 failures;
+- `libdevice.add_rn` for only the four per-lane numerator additions still left
+  10 failures; the entire fixed reduction tree was required.
+
+Validation commands:
+
+```bash
+python3 tools/check_benchmark_integrity.py
+.venv/bin/python -m unittest -v test_triton_fused_attention.py
+.venv/bin/python torch_transformer_benchmark.py --batch-size 256 \
+  --benchmark-rounds 16 --dtype float16
+```
+
+Final RTX 5070 Ti result with PyTorch 2.13.0+cu130: all five accuracy trials
+were bit-exact (`0/83,886,080` failures, `max_abs=0`). Baseline median latency
+was 39.2704 ms and optimized median latency was 29.1389 ms, for a valid 1.348x
+speedup. The complete nine-test attention suite passed, including causal and
+padded partial tiles, bf16 correctness fallback, and CPU autograd fallback.
+
+Additional five-trial FP16 six-layer checks were bit-exact for `S=33` with
+padding, `S=64`, and causal padded `S=97`. The first `S=64` probe exposed one
+failure while using generic `tl.sum`; extending the explicit reduction tree to
+64- and 32-wide rows eliminated it. The one-repeat smoke timings for these edge
+shapes are correctness diagnostics rather than final performance claims.
+
+## Blackwell true full-fusion implementation
+
+Date: 2026-08-29
+
+The final adapter now uses `triton_gluon_attention.py` on FP16 Blackwell
+(`compute capability 12.x`) for exact power-of-two sequence lengths 32, 64,
+and 128. Each CTA owns a query tile and batch/head pair. Gluon `mma_v2`
+performs both QK and P@V, while the score mask, `libdevice.exp`, and a custom
+`libdevice.add_rn` reduction match the baseline's FP16 rounding on the tested
+shapes. The kernel writes only the final context; it never allocates or writes
+a global `[B,H,S,S]` probability tensor. Partial sequence lengths and
+unsupported devices/dtypes use the value-equivalent reference fallback.
+
+The planned `tcgen05`/TMEM route was also probed, but this Triton build fails
+LLVM lowering of `tcgen05.wait` on the target environment. The implementation
+therefore uses Gluon's documented `mma_v2` path as the safe Blackwell fallback;
+the dispatch boundary keeps that hardware-specific choice isolated.
+
+The adapter also keeps Q/K/V in their transposed views and asks the fused core
+to write `[B,S,H,D]` directly. This removes the three head-repacking copies and
+the post-attention transpose from the timed FP16 path.
+
+Validation and benchmark command:
+
+```bash
+python3 tools/check_benchmark_integrity.py
+.venv/bin/python torch_transformer_benchmark.py --batch-size 256 \
+  --benchmark-rounds 16 --dtype float16 --benchmark-on-failure
+```
+
+On the NVIDIA GeForce RTX 5070 Ti with PyTorch 2.13.0+cu130, all five
+accuracy trials were bit-exact (`0/83,886,080` failures, `max_abs=0`). The
+latest run measured 39.7002 ms baseline versus 25.8242 ms optimized median
+latency, a valid 1.537x speedup.
+
+An identical second 16-round run also passed all five trials and measured
+41.0487 ms baseline versus 27.0089 ms optimized (1.520x median speedup).
+
+Shape/mask checks also passed with the official tolerance: FP16 `S=64` padded,
+FP16 causal padded `S=97`, FP16 padded `S=33`, FP16 causal `S=32`, and BF16
+fallback. The partial-length cases intentionally dispatch to the correctness
+fallback; their smoke timings are not used for the headline speed claim.
