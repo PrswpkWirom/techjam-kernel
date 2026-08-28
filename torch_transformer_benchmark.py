@@ -24,7 +24,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from triton_softmax import TritonSelfAttention
+
 
 
 @dataclass(frozen=True)
@@ -182,7 +182,7 @@ class UserOptimizedTransformer(BaselineTransformer):
       2. Return a tensor with shape [batch_size, seq_len, d_model].
       3. Keep compatible parameter names, or customize copy_model_weights().
     """
-
+    from triton_softmax import TritonSelfAttention
     from triton_fused_attention import TritonFusedSelfAttention
 
     # Manually select the attention implementation here. The selected class must
