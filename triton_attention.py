@@ -44,9 +44,9 @@ def _attention_softmax_kernel(
     )
     # The baseline scales in the model dtype, then promotes to fp32 for
     # softmax. Preserve that rounding point before the fp32 reductions.
-    score = score*scale
-    # score = (score.to(tl.float32) * scale).to(scores_ptr.dtype.element_ty)
-    # score = score.to(tl.float32)
+    #score = score*scale
+    score = (score.to(tl.float32) * scale).to(scores_ptr.dtype.element_ty)
+    score = score.to(tl.float32)
 
     # Flattened rows vary query first, then head, then batch.
     query_position = row % seq_len
@@ -67,6 +67,7 @@ def _attention_softmax_kernel(
     row_max = tl.max(score, axis=0)
     # libdevice.exp is more accurate than Triton's fast approximate exponential.
     # That precision matters because small errors compound through model layers.
+    #numerator = tl.exp(score - row_max)
     numerator = libdevice.exp(score - row_max)
     if BLOCK_SIZE == 128:
         # PyTorch's CUDA persistent softmax gives each warp lane four values
@@ -87,6 +88,7 @@ def _attention_softmax_kernel(
     else:
         denominator = tl.sum(numerator, axis=0)
     probability = libdevice.div_rn(numerator, denominator)
+    #probability = numerator / denominator
     tl.store(
         probabilities_ptr + row * seq_len + key_position,
         probability,
