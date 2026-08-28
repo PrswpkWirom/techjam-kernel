@@ -187,7 +187,7 @@ class UserOptimizedTransformer(BaselineTransformer):
 
     # Manually select the attention implementation here. The selected class must
     # accept (d_model, num_heads) and expose baseline-compatible parameters.
-    attention_class = TritonSelfAttention
+    attention_class = TritonFusedSelfAttention
 
     def __init__(self, config: TransformerConfig) -> None:
         super().__init__(config)
