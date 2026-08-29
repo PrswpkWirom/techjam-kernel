@@ -201,10 +201,13 @@ class UserOptimizedTransformer(BaselineTransformer):
 
         # Attention is the only adapter changed in this iteration. The block,
         # FFN, norms, and state-dict paths remain exactly those of the baseline.
-        for layer in self.layers:
+        for layer_index, layer in enumerate(self.layers):
             layer.attention = self.attention_class(
                 config.d_model, config.num_heads
             )
+            # The first long D_head=32 block uses the exact bounded attention
+            # mode; later blocks can safely use the faster Triton recurrence.
+            setattr(layer.attention, "_long_sequence_layer_index", layer_index)
 
     def _is_extreme_long_sequence_case(self, x: torch.Tensor) -> bool:
         """Return whether the memory-sensitive competition case is active."""

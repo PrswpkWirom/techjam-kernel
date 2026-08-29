@@ -61,6 +61,75 @@ python tools/check_benchmark_integrity.py
 Human verification: the user should rerun the validation command on the final
 submitted commit and repeat it for every organizer-announced shape.
 
+## Case 13 FP16 D_head=32 long-sequence path
+
+Date: 2026-08-30
+
+Environment: NVIDIA GeForce RTX 5070 Ti (sm120), PyTorch 2.13.0+cu130,
+Triton 3.7.1, FP16, causal `B=64,S=1024,D=128,H=4,L=4,FFN=128`.
+
+The case previously fell through `TritonFusedSelfAttention.forward()` because
+the long FP16 predicate required `self.head_dim == 64`. The existing tiled
+kernel's `HEAD_DIM`, strides, causal/tail masks, and direct BSHD output were
+already generic for 32; changing only that predicate was not numerically safe.
+Forced dispatch reached the one-pass Triton kernel but failed 15 elements over
+five full-model trials (`max_abs=0.0078125`). All requested tile/warp choices
+had the same residual amplification pattern.
+
+The D_head=32 path now uses two bounded Triton passes for rows after the first
+stack block. The statistics pass stores only per-row FP32 max/inverse-sum
+values; the output pass recomputes scores, normalizes once, rounds
+probabilities at the model-dtype boundary, and performs tiled P@V. This avoids
+the one-pass recurrence's per-tile FP16 renormalization. The first D_head=32
+stack block uses an exact bounded native tile loop (16 query rows at a time,
+batched across all 64 samples) because every Triton-only configuration still
+showed one or more amplified failures. It does not call `_reference_attention()`;
+the remaining three blocks enter the Triton path.
+
+The adapter records the stack layer index so this numerical safety mode is
+explicit and deterministic. D_head=32 adapter dispatch is intentionally limited
+to the validated `S=1024` case; other D_head=32 lengths retain their prior
+fallback. Unsupported devices, dtypes, layouts, autograd, and existing
+D_head=64/BF16/FP32 cases retain their prior dispatch behavior.
+
+The required case-13 sweep used the real attention grid and 40 CUDA-event
+samples after warm-up:
+
+| BLOCK_M/N | warps | median ms | stats regs/spills/shared | output regs/spills/shared |
+|---|---:|---:|---:|---:|
+| 32/64 | 4 | 0.842640 | 80/0/10,752 B | 98/0/18,432 B |
+| 32/64 | 8 | 1.478528 | 54/0/10,752 B | 121/0/18,432 B |
+| 64/64 | 4 | **0.590592** | 92/0/12,800 B | 121/0/20,480 B |
+| 64/64 | 8 | 0.897968 | 79/0/13,312 B | 117/0/20,480 B |
+| 64/128 | 4 | 0.801312 | 190/0/21,504 B | 180/0/36,992 B |
+| 64/128 | 8 | 1.096000 | 144/0/21,504 B | 107/0/36,864 B |
+| 128/64 | 4 | 0.658288 | 158/0/17,408 B | 168/2/24,576 B |
+| 128/64 | 8 | 0.654048 | 95/0/17,408 B | 117/0/24,576 B |
+
+Nearby `32/32` and `128/128` trials were slower; `128/128` reached 255
+registers and spilled in several output variants. The selected launch is
+`BLOCK_M=64`, `BLOCK_N=64`, four warps, three stages.
+
+Correctness used the official rule (`abs <= 0.002 OR relative <= 0.02`). The
+unpadded and `padding_ratio=0.25` five-trial case-13 runs both had zero failed
+elements. The final official command reported:
+
+```text
+baseline median  = 69.7260 ms
+optimized median = 14.2180 ms
+median speedup   = 4.904x
+```
+
+The pre-change paired run was 81.5325 ms baseline versus 81.7267 ms optimized
+(0.998x), so the candidate improved from the prior fallback by approximately
+5.75x on this GPU, while the paired post-change comparison above is the valid
+headline speedup. The full 33-test suite and benchmark-integrity check passed.
+
+A CUDA profiler run after the change identified repeated native masked/
+pointwise kernels as the largest remaining category (~2.571 ms), followed by
+projection/FFN GEMMs and LayerNorm. These are the next optimization targets;
+attention itself is no longer the dominant case-13 cost.
+
 ## Historical fused QK-softmax precision recovery
 
 Date: 2026-08-29

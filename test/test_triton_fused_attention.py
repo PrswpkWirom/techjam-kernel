@@ -9,6 +9,7 @@ import torch
 
 from model.triton_fused_attention import (
     TritonFusedSelfAttention,
+    _blocked_fp16_attention,
     triton_fused_attention,
     triton_fused_full_attention,
 )
@@ -357,6 +358,116 @@ class TritonFusedAttentionTests(unittest.TestCase):
                 self.assertEqual(tuple(output.shape), tuple(x.shape))
                 self.assertEqual(output.dtype, x.dtype)
                 self.assertTrue(bool(torch.isfinite(output).all()))
+
+    def test_case13_d32_adapter_enters_tiled_path_and_matches_baseline(self) -> None:
+        """The published long FP16 D_head=32 case must not use dense attention."""
+        from torch_transformer_benchmark import (
+            BaselineTransformer,
+            TransformerConfig,
+            UserOptimizedTransformer,
+            copy_model_weights,
+            generate_random_case,
+        )
+
+        config = TransformerConfig(
+            batch_size=64,
+            seq_len=1024,
+            d_model=128,
+            num_heads=4,
+            ffn_dim=128,
+            num_layers=4,
+            causal=True,
+        )
+        torch.manual_seed(13132)
+        torch.cuda.manual_seed_all(13132)
+        baseline = BaselineTransformer(config).cuda().half().eval()
+        candidate = UserOptimizedTransformer(config).cuda().half().eval()
+        copy_model_weights(baseline, candidate)
+        x, valid_token_mask = generate_random_case(
+            config=config,
+            device=torch.device("cuda"),
+            dtype=torch.float16,
+            seed=13132,
+            padding_ratio=0.0,
+            input_scale=1.0,
+        )
+
+        with mock.patch(
+            "model.triton_fused_attention._reference_attention",
+            side_effect=AssertionError("unexpected case-13 dense fallback"),
+        ), mock.patch(
+            "model.triton_fused_attention.triton_fused_attention",
+            wraps=triton_fused_attention,
+        ) as fused, mock.patch(
+            "model.triton_fused_attention._blocked_fp16_attention",
+            wraps=_blocked_fp16_attention,
+        ) as exact_block:
+            with torch.inference_mode():
+                expected = baseline(x, valid_token_mask)
+                actual = candidate(x, valid_token_mask)
+
+        self.assertEqual(fused.call_count, config.num_layers - 1)
+        exact_block.assert_called_once()
+        _assert_official_tolerance(actual, expected)
+        self.assertTrue(bool(torch.isfinite(actual).all()))
+
+    def test_case13_d32_tiled_path_handles_padding(self) -> None:
+        """D_head=32 long attention keeps padded keys and queries correct."""
+        from torch_transformer_benchmark import (
+            BaselineTransformer,
+            TransformerConfig,
+            UserOptimizedTransformer,
+            copy_model_weights,
+            generate_random_case,
+        )
+
+        config = TransformerConfig(64, 1024, 128, 4, 128, 4, True)
+        torch.manual_seed(13133)
+        torch.cuda.manual_seed_all(13133)
+        baseline = BaselineTransformer(config).cuda().half().eval()
+        candidate = UserOptimizedTransformer(config).cuda().half().eval()
+        copy_model_weights(baseline, candidate)
+        x, valid_token_mask = generate_random_case(
+            config=config,
+            device=torch.device("cuda"),
+            dtype=torch.float16,
+            seed=13133,
+            padding_ratio=0.25,
+            input_scale=1.0,
+        )
+
+        with mock.patch(
+            "model.triton_fused_attention._reference_attention",
+            side_effect=AssertionError("unexpected case-13 dense fallback"),
+        ):
+            with torch.inference_mode():
+                expected = baseline(x, valid_token_mask)
+                actual = candidate(x, valid_token_mask)
+
+        _assert_official_tolerance(actual, expected)
+        self.assertTrue(bool((actual[~valid_token_mask] == 0).all()))
+
+    def test_long_d32_attention_seam_enters_triton_kernel(self) -> None:
+        """A standalone long D_head=32 call uses the Triton tiled seam."""
+        torch.manual_seed(13134)
+        with mock.patch(
+            "model.triton_fused_attention._reference_attention",
+            side_effect=AssertionError("unexpected D_head=32 dense fallback"),
+        ), mock.patch(
+            "model.triton_fused_attention.triton_fused_attention",
+            wraps=triton_fused_attention,
+        ) as fused:
+            with torch.inference_mode():
+                output = TritonFusedSelfAttention(128, 4).cuda().half().eval()(
+                    torch.randn(
+                        (1, 1024, 128), device="cuda", dtype=torch.float16
+                    ),
+                    torch.ones((1, 1024), device="cuda", dtype=torch.bool),
+                    causal=True,
+                )
+        fused.assert_called_once()
+        self.assertEqual(tuple(output.shape), (1, 1024, 128))
+        self.assertTrue(bool(torch.isfinite(output).all()))
 
     def test_bfloat16_fused_dispatch_can_be_enabled_for_long_case(self) -> None:
         """The exact long BF16 case reaches the Triton seam, not native tiles."""
