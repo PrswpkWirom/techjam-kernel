@@ -210,7 +210,7 @@ class UserOptimizedTransformer(BaselineTransformer):
         """Return whether the memory-sensitive competition case is active."""
         return (
             x.device.type == "cuda"
-            and x.dtype == torch.float16
+            and x.dtype in (torch.float16, torch.bfloat16)
             and not torch.is_grad_enabled()
             and x.ndim == 3
             and x.shape[0] == self._LONG_SEQUENCE_BATCH

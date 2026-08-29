@@ -247,6 +247,34 @@ speedup claim. The long path also passed the competition tolerance at
 elements; maximum absolute errors were `0.00390625`, `0.00390625`,
 `0.00488281`, and `0.00488281`, respectively.
 
+### BF16 long-sequence extension
+
+Date: 2026-08-30
+
+The exact case-14 whole-model microbatch dispatcher and optimized-only smoke
+tool now also accept BF16. Directly changing the FP16 Triton online-softmax
+kernel to BF16 was rejected: isolated attention passed, but two-layer D=1024
+validation failed the official per-element rule. The production BF16 path
+instead preserves PyTorch's BF16 matmul and FP32-softmax operation order in
+fixed 16-query blocks. It reuses the private Q projection as the context
+buffer and bounds temporary scores/probabilities at `[1,H,16,S]`; it never
+creates `[B,H,S,S]` or `[S,S]` storage. This is exact but substantially slower
+than the FP16 Triton path.
+
+BF16 invocation:
+
+```bash
+.venv/bin/python tools/smoke_long_sequence.py --dtype bfloat16
+```
+
+Two-layer D=1024 validation at S=257/1024/2048/4096 passed the official OR
+tolerance with zero failing elements. On the NVIDIA GeForce RTX 5070 Ti
+(PyTorch 2.13.0+cu130), the full command above passed with output shape
+`(32,100000,1024)`, dtype `torch.bfloat16`, and all finite values. Runtime was
+`1059438.750 ms` (about 17m39s), peak allocated memory was `14421.9 MiB`, and
+peak reserved memory was `14732.0 MiB`. This demonstrates compatibility, not a
+competitive speedup; FP16 remains the recommended case-14 dtype.
+
 ## BF16 and FP32 Gluon full-fusion extension
 
 Date: 2026-08-29

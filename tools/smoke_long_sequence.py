@@ -33,14 +33,17 @@ def _all_finite_by_batch(output: torch.Tensor) -> bool:
     return True
 
 
-def run_smoke(seed: int) -> int:
+def run_smoke(seed: int, dtype_name: str) -> int:
     if not torch.cuda.is_available():
         print("status: ERROR")
         print("reason: CUDA is unavailable")
         return 2
 
     device = torch.device("cuda")
-    dtype = torch.float16
+    dtype = {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }[dtype_name]
     config = TransformerConfig(
         batch_size=32,
         seq_len=100_000,
@@ -72,13 +75,15 @@ def run_smoke(seed: int) -> int:
             config.batch_size, config.seq_len, device=device, dtype=torch.bool
         )
         with torch.inference_mode():
-            # Compile the long attention specialization before measuring the
-            # complete batch.  A single sample does not enter model-level
-            # microbatching but exercises both Transformer layers.
-            warm_output = model(x[:1], valid_token_mask[:1])
-            torch.cuda.synchronize(device)
-            del warm_output
-            torch.cuda.empty_cache()
+            if dtype == torch.float16:
+                # Compile the Triton specialization before measuring FP16.
+                warm_output = model(x[:1], valid_token_mask[:1])
+                torch.cuda.synchronize(device)
+                del warm_output
+                torch.cuda.empty_cache()
+            # BF16 uses native bounded PyTorch operations rather than a JIT
+            # kernel. Avoiding a redundant 100k-token warmup also leaves the
+            # allocator unfragmented before this near-capacity smoke test.
 
             torch.cuda.reset_peak_memory_stats(device)
             start = torch.cuda.Event(enable_timing=True)
@@ -111,8 +116,13 @@ def run_smoke(seed: int) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument(
+        "--dtype",
+        choices=("float16", "bfloat16"),
+        default="float16",
+    )
     args = parser.parse_args()
-    return run_smoke(args.seed)
+    return run_smoke(args.seed, args.dtype)
 
 
 if __name__ == "__main__":

@@ -25,6 +25,7 @@ from .triton_gluon_attention import (
 _SUPPORTED_HEAD_DIMS = (16, 32, 64, 128)
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _LONG_SEQUENCE_MIN_LENGTH = 257
+_BF16_QUERY_BLOCK_SIZE = 16
 
 
 @triton.jit
@@ -797,6 +798,72 @@ def _reference_attention(
     return torch.matmul(probabilities, v_ref)
 
 
+def _blocked_bfloat16_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    valid_token_mask: Optional[torch.Tensor],
+    causal: bool,
+    scale: float,
+) -> torch.Tensor:
+    """Exact BF16 attention with an O(S) bounded score workspace.
+
+    PyTorch's BF16 matmul and softmax reduction order is needed to satisfy the
+    organizer's full-model tolerance.  Each iteration materializes only
+    ``[1, H, 16, S]`` scores/probabilities, never ``[B, H, S, S]``.  ``q`` is a
+    private contiguous projection buffer, so completed query rows are safely
+    replaced with their context and reused as the attention output buffer.
+    """
+    batch, _, sequence_length, _ = _validate_inputs(
+        q, k, v, valid_token_mask
+    )
+    if q.dtype != torch.bfloat16:
+        raise TypeError(
+            "blocked BF16 attention requires torch.bfloat16 q/k/v tensors"
+        )
+    if scale <= 0.0:
+        raise ValueError("scale must be positive")
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
+    key_positions = torch.arange(sequence_length, device=q.device)
+
+    for batch_index in range(batch):
+        batch_mask = (
+            valid_token_mask[batch_index : batch_index + 1]
+            if valid_token_mask is not None
+            else None
+        )
+        for query_start in range(0, sequence_length, _BF16_QUERY_BLOCK_SIZE):
+            query_end = min(query_start + _BF16_QUERY_BLOCK_SIZE, sequence_length)
+            scores = torch.matmul(
+                q[batch_index : batch_index + 1, :, query_start:query_end],
+                k[batch_index : batch_index + 1].transpose(-2, -1),
+            ) * scale
+            if causal:
+                query_positions = torch.arange(
+                    query_start, query_end, device=q.device
+                )
+                scores.masked_fill_(
+                    key_positions[None, None, None, :]
+                    > query_positions[None, None, :, None],
+                    float("-inf"),
+                )
+            if batch_mask is not None:
+                scores.masked_fill_(
+                    ~batch_mask[:, None, None, :], float("-inf")
+                )
+            probabilities = torch.softmax(scores.float(), dim=-1).to(q.dtype)
+            context = torch.matmul(
+                probabilities, v[batch_index : batch_index + 1]
+            )
+            q[
+                batch_index : batch_index + 1, :, query_start:query_end
+            ].copy_(context)
+
+    return q.transpose(1, 2).contiguous()
+
+
 def _launch_configuration(
     sequence_length: int, head_dim: int, causal: bool
 ) -> tuple[int, int, int, int]:
@@ -1126,6 +1193,14 @@ class TritonFusedSelfAttention(nn.Module):
             and self.head_dim == 64
             and not needs_autograd
         )
+        can_use_long_bfloat16_attention = (
+            x.device.type == "cuda"
+            and x.dtype == torch.bfloat16
+            and causal
+            and sequence_length >= _LONG_SEQUENCE_MIN_LENGTH
+            and self.head_dim == 64
+            and not needs_autograd
+        )
         if can_use_fused_full_attention:
             context = triton_fused_full_attention(
                 q,
@@ -1150,6 +1225,15 @@ class TritonFusedSelfAttention(nn.Module):
                 output_bshd=True,
             )
             context = context.view(batch, sequence_length, self.d_model)
+        elif can_use_long_bfloat16_attention:
+            context = _blocked_bfloat16_attention(
+                q,
+                k,
+                v,
+                valid_token_mask,
+                causal,
+                self.scale,
+            ).view(batch, sequence_length, self.d_model)
         else:
             context = _reference_attention(
                 q,

@@ -338,21 +338,66 @@ class TritonFusedAttentionTests(unittest.TestCase):
                 gc.collect()
                 torch.cuda.empty_cache()
 
-    def test_long_adapter_dispatches_to_tiled_attention(self) -> None:
-        """Causal FP16 D_head=64 lengths above the Gluon envelope stay tiled."""
-        torch.manual_seed(6124)
-        candidate = TritonFusedSelfAttention(128, 2).cuda().half().eval()
-        x = torch.randn((1, 257, 128), device="cuda", dtype=torch.float16)
-        valid_token_mask = torch.ones((1, 257), device="cuda", dtype=torch.bool)
-        with mock.patch(
-            "model.triton_fused_attention._reference_attention",
-            side_effect=AssertionError("unexpected dense long fallback"),
-        ):
-            with torch.inference_mode():
-                output = candidate(x, valid_token_mask, causal=True)
-        self.assertEqual(tuple(output.shape), tuple(x.shape))
-        self.assertEqual(output.dtype, x.dtype)
-        self.assertTrue(bool(torch.isfinite(output).all()))
+    def test_long_adapter_avoids_dense_reference(self) -> None:
+        """Causal 16-bit D_head=64 lengths above Gluon's envelope stay bounded."""
+        for dtype in (torch.float16, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                torch.manual_seed(6124)
+                candidate = TritonFusedSelfAttention(128, 2).cuda().to(dtype).eval()
+                x = torch.randn((1, 257, 128), device="cuda", dtype=dtype)
+                valid_token_mask = torch.ones(
+                    (1, 257), device="cuda", dtype=torch.bool
+                )
+                with mock.patch(
+                    "model.triton_fused_attention._reference_attention",
+                    side_effect=AssertionError("unexpected dense long fallback"),
+                ):
+                    with torch.inference_mode():
+                        output = candidate(x, valid_token_mask, causal=True)
+                self.assertEqual(tuple(output.shape), tuple(x.shape))
+                self.assertEqual(output.dtype, x.dtype)
+                self.assertTrue(bool(torch.isfinite(output).all()))
+
+    def test_long_bfloat16_two_layer_model_matches_reference(self) -> None:
+        """Catch BF16 attention drift after residuals amplify it across layers."""
+        from torch_transformer_benchmark import (
+            BaselineTransformer,
+            TransformerConfig,
+            UserOptimizedTransformer,
+            copy_model_weights,
+        )
+
+        for sequence_length in (257, 1024, 2048, 4096):
+            with self.subTest(sequence_length=sequence_length):
+                config = TransformerConfig(
+                    batch_size=1,
+                    seq_len=sequence_length,
+                    d_model=1024,
+                    num_heads=16,
+                    ffn_dim=1024,
+                    num_layers=2,
+                    causal=True,
+                )
+                torch.manual_seed(73000 + sequence_length)
+                baseline = BaselineTransformer(config).cuda().bfloat16().eval()
+                candidate = (
+                    UserOptimizedTransformer(config).cuda().bfloat16().eval()
+                )
+                copy_model_weights(baseline, candidate)
+                x = torch.randn(
+                    (1, sequence_length, 1024),
+                    device="cuda",
+                    dtype=torch.bfloat16,
+                )
+                valid_length = 211 if sequence_length == 257 else sequence_length
+                mask = (
+                    torch.arange(sequence_length, device="cuda")[None, :]
+                    < valid_length
+                )
+                with torch.inference_mode():
+                    expected = baseline(x, mask)
+                    actual = candidate(x, mask)
+                _assert_official_tolerance(actual, expected)
 
     def test_whole_model_microbatch_helper_matches_batched_execution(self) -> None:
         """The helper preserves complete-stack semantics for each sample."""
