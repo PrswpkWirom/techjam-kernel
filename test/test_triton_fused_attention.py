@@ -358,6 +358,28 @@ class TritonFusedAttentionTests(unittest.TestCase):
                 self.assertEqual(output.dtype, x.dtype)
                 self.assertTrue(bool(torch.isfinite(output).all()))
 
+    def test_bfloat16_fused_dispatch_can_be_enabled_for_long_case(self) -> None:
+        """The exact long BF16 case reaches the Triton seam, not native tiles."""
+        torch.manual_seed(6125)
+        candidate = TritonFusedSelfAttention(128, 2).cuda().bfloat16().eval()
+        x = torch.randn((1, 257, 128), device="cuda", dtype=torch.bfloat16)
+        mask = torch.ones((1, 257), device="cuda", dtype=torch.bool)
+        with mock.patch(
+            "model.triton_fused_attention._BF16_FUSED_MIN_LENGTH", 257
+        ), mock.patch(
+            "model.triton_fused_attention.triton_fused_attention",
+            wraps=triton_fused_attention,
+        ) as fused, mock.patch(
+            "model.triton_fused_attention._reference_attention",
+            side_effect=AssertionError("unexpected BF16 dense fallback"),
+        ):
+            with torch.inference_mode():
+                output = candidate(x, mask, causal=True)
+        fused.assert_called_once()
+        self.assertEqual(tuple(output.shape), tuple(x.shape))
+        self.assertEqual(output.dtype, x.dtype)
+        self.assertTrue(bool(torch.isfinite(output).all()))
+
     def test_long_bfloat16_two_layer_model_matches_reference(self) -> None:
         """Catch BF16 attention drift after residuals amplify it across layers."""
         from torch_transformer_benchmark import (

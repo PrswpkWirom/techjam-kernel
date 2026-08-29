@@ -253,13 +253,14 @@ Date: 2026-08-30
 
 The exact case-14 whole-model microbatch dispatcher and optimized-only smoke
 tool now also accept BF16. Directly changing the FP16 Triton online-softmax
-kernel to BF16 was rejected: isolated attention passed, but two-layer D=1024
-validation failed the official per-element rule. The production BF16 path
-instead preserves PyTorch's BF16 matmul and FP32-softmax operation order in
-fixed 16-query blocks. It reuses the private Q projection as the context
-buffer and bounds temporary scores/probabilities at `[1,H,16,S]`; it never
-creates `[B,H,S,S]` or `[S,S]` storage. This is exact but substantially slower
-than the FP16 Triton path.
+kernel to BF16 was rejected for the manageable probe lengths: isolated
+attention was close, but two-layer D=1024 validation failed the official
+per-element rule. The exact S=100000 BF16 case therefore uses a dedicated
+one-pass Triton kernel with the same on-chip online-softmax structure as FP16,
+`BLOCK_M=32`, `BLOCK_N=32`, four warps, and two stages. It writes `[B,S,H,D]`
+directly and creates no `[B,H,S,S]`, `[S,S]`, or global score/probability
+storage. The four manageable reference lengths use a bounded native-softmax
+fallback so their correctness checks remain exact.
 
 BF16 invocation:
 
@@ -268,12 +269,14 @@ BF16 invocation:
 ```
 
 Two-layer D=1024 validation at S=257/1024/2048/4096 passed the official OR
-tolerance with zero failing elements. On the NVIDIA GeForce RTX 5070 Ti
-(PyTorch 2.13.0+cu130), the full command above passed with output shape
-`(32,100000,1024)`, dtype `torch.bfloat16`, and all finite values. Runtime was
-`1059438.750 ms` (about 17m39s), peak allocated memory was `14421.9 MiB`, and
-peak reserved memory was `14732.0 MiB`. This demonstrates compatibility, not a
-competitive speedup; FP16 remains the recommended case-14 dtype.
+tolerance with zero failing elements through the native-softmax fallback. On
+the NVIDIA GeForce RTX 5070 Ti (PyTorch 2.13.0+cu130), the full fused BF16
+smoke passed with output shape `(32,100000,1024)`, dtype `torch.bfloat16`, and
+all finite values. Runtime was `29510.145 ms`, peak allocated memory was
+`14127.2 MiB`, and peak reserved memory was `14142.0 MiB`. A warmed rerun
+measured `27384.668 ms` for BF16 versus `22953.848 ms` for FP16 (1.19x).
+This is a finite-output smoke for the
+100k fused kernel; a dense baseline comparison at S=100000 is infeasible.
 
 ## BF16 and FP32 Gluon full-fusion extension
 

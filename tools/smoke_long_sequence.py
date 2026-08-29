@@ -75,15 +75,13 @@ def run_smoke(seed: int, dtype_name: str) -> int:
             config.batch_size, config.seq_len, device=device, dtype=torch.bool
         )
         with torch.inference_mode():
-            if dtype == torch.float16:
-                # Compile the Triton specialization before measuring FP16.
-                warm_output = model(x[:1], valid_token_mask[:1])
-                torch.cuda.synchronize(device)
-                del warm_output
-                torch.cuda.empty_cache()
-            # BF16 uses native bounded PyTorch operations rather than a JIT
-            # kernel. Avoiding a redundant 100k-token warmup also leaves the
-            # allocator unfragmented before this near-capacity smoke test.
+            # Compile the long Triton specialization before measuring either
+            # dtype. A single sample exercises both Transformer layers without
+            # entering the model-level B=32 microbatch loop.
+            warm_output = model(x[:1], valid_token_mask[:1])
+            torch.cuda.synchronize(device)
+            del warm_output
+            torch.cuda.empty_cache()
 
             torch.cuda.reset_peak_memory_stats(device)
             start = torch.cuda.Event(enable_timing=True)

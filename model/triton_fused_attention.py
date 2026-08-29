@@ -24,7 +24,9 @@ from .triton_gluon_attention import (
 
 _SUPPORTED_HEAD_DIMS = (16, 32, 64, 128)
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+_TILED_ATTENTION_DTYPES = (torch.float16, torch.bfloat16)
 _LONG_SEQUENCE_MIN_LENGTH = 257
+_BF16_FUSED_MIN_LENGTH = 100_000
 _BF16_QUERY_BLOCK_SIZE = 16
 
 
@@ -58,6 +60,7 @@ def _fused_attention_forward_kernel(
     NUM_STAGES: tl.constexpr,
     CAUSAL: tl.constexpr,
     HAS_VALID_TOKEN_MASK: tl.constexpr,
+    TRANSPOSED_PV: tl.constexpr,
 ) -> None:
     """Compute one query tile for one batch element and attention head."""
     query_tile = tl.program_id(0)
@@ -181,10 +184,9 @@ def _fused_attention_forward_kernel(
         new_sum = running_sum * alpha + tile_sum
 
         # Keep ACC as the normalized context for all keys processed so far.
-        # This is algebraically the same online softmax recurrence, but it makes
-        # the Tensor-Core input p/new_sum resemble the baseline's final softmax
-        # probabilities before the model-dtype cast. That materially reduces
-        # fp16/bf16 rounding drift across multiple Transformer layers.
+        # This is algebraically the same online softmax recurrence, but it
+        # makes the Tensor-Core input p/new_sum resemble the baseline's
+        # final softmax probabilities before the model-dtype cast.
         denominator = tl.where(new_sum > 0.0, new_sum, 1.0)
         previous_weight = tl.where(
             new_sum > 0.0,
@@ -193,7 +195,15 @@ def _fused_attention_forward_kernel(
         )
         normalized_p = p / denominator[:, None]
         accumulator = accumulator * previous_weight[:, None]
-        accumulator = tl.dot(normalized_p.to(v.dtype), v, accumulator)
+        if TRANSPOSED_PV:
+            accumulator_t = tl.dot(
+                tl.trans(v),
+                tl.trans(normalized_p.to(v.dtype)),
+                tl.trans(accumulator),
+            )
+            accumulator = tl.trans(accumulator_t)
+        else:
+            accumulator = tl.dot(normalized_p.to(v.dtype), v, accumulator)
 
         running_sum = new_sum
         running_max = new_max
@@ -865,9 +875,11 @@ def _blocked_bfloat16_attention(
 
 
 def _launch_configuration(
-    sequence_length: int, head_dim: int, causal: bool
+    dtype: torch.dtype, sequence_length: int, head_dim: int, causal: bool
 ) -> tuple[int, int, int, int]:
     """Conservative launch choices; benchmark-specific tuning comes after correctness."""
+    if dtype == torch.bfloat16 and sequence_length >= _BF16_FUSED_MIN_LENGTH:
+        return 32, 32, 4, 1
     if sequence_length <= 64:
         return 32, 32, 4, 2
     if head_dim <= 64:
@@ -924,7 +936,11 @@ def triton_fused_attention(
 
     if (
         q.device.type != "cuda"
-        or q.dtype != torch.float16
+        or q.dtype not in _TILED_ATTENTION_DTYPES
+        or (
+            q.dtype == torch.bfloat16
+            and sequence_length < _BF16_FUSED_MIN_LENGTH
+        )
         or head_dim not in _SUPPORTED_HEAD_DIMS
         or q.stride(-1) != 1
         or k.stride(-1) != 1
@@ -947,7 +963,7 @@ def triton_fused_attention(
     output_stride_head = output.stride(1 if not output_bshd else 2)
     output_stride_sequence = output.stride(2 if not output_bshd else 1)
     block_m, block_n, num_warps, num_stages = _launch_configuration(
-        sequence_length, head_dim, causal
+        q.dtype, sequence_length, head_dim, causal
     )
 
     # The no-mask specialization never dereferences this pointer. Reuse q rather
@@ -988,6 +1004,7 @@ def triton_fused_attention(
         NUM_STAGES=num_stages,
         CAUSAL=causal,
         HAS_VALID_TOKEN_MASK=valid_token_mask is not None,
+        TRANSPOSED_PV=q.dtype == torch.bfloat16,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -1226,14 +1243,21 @@ class TritonFusedSelfAttention(nn.Module):
             )
             context = context.view(batch, sequence_length, self.d_model)
         elif can_use_long_bfloat16_attention:
-            context = _blocked_bfloat16_attention(
-                q,
-                k,
-                v,
-                valid_token_mask,
-                causal,
-                self.scale,
-            ).view(batch, sequence_length, self.d_model)
+            if sequence_length >= _BF16_FUSED_MIN_LENGTH:
+                context = triton_fused_attention(
+                    q,
+                    k,
+                    v,
+                    valid_token_mask=valid_token_mask,
+                    causal=causal,
+                    scale=self.scale,
+                    output_bshd=True,
+                )
+            else:
+                context = _blocked_bfloat16_attention(
+                    q, k, v, valid_token_mask, causal, self.scale
+                )
+            context = context.view(batch, sequence_length, self.d_model)
         else:
             context = _reference_attention(
                 q,
