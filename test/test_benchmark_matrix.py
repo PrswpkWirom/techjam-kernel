@@ -3,9 +3,14 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
-from benchmark_log_parser import evaluation_status, parse_benchmark_log
-from benchmark_shape_matrix import ANNOUNCED_CASES, format_bytes, parse_case_ids, select_cases
-from run_benchmark_matrix import (
+from tools.benchmark_log_parser import evaluation_status, parse_benchmark_log
+from tools.benchmark_shape_matrix import (
+    ANNOUNCED_CASES,
+    format_bytes,
+    parse_case_ids,
+    select_cases,
+)
+from tools.run_benchmark_matrix import (
     build_command,
     dtype_bytes,
     manifest_signature,
@@ -13,7 +18,7 @@ from run_benchmark_matrix import (
     preflight_reason,
     text_output,
 )
-from visualize_benchmark_matrix import valid_results
+from tools.visualize_benchmark_matrix import valid_results
 
 
 PASS_LOG = """

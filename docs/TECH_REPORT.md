@@ -52,9 +52,9 @@ recorded only as a failed experiment and is not claimed as a valid speedup.
 Automated verification:
 
 ```bash
-python -m unittest -v test_triton_fused_attention.py
-python -m py_compile triton_fused_attention.py triton_softmax.py \
-  test_triton_fused_attention.py torch_transformer_benchmark.py
+python -m unittest -v test.test_triton_fused_attention
+python -m py_compile model/triton_fused_attention.py model/triton_softmax.py \
+  test/test_triton_fused_attention.py torch_transformer_benchmark.py
 python tools/check_benchmark_integrity.py
 ```
 
@@ -95,7 +95,7 @@ Validation commands:
 
 ```bash
 python3 tools/check_benchmark_integrity.py
-.venv/bin/python -m unittest -v test_triton_fused_attention.py
+.venv/bin/python -m unittest -v test.test_triton_fused_attention
 .venv/bin/python torch_transformer_benchmark.py --batch-size 256 \
   --benchmark-rounds 16 --dtype float16
 ```
@@ -116,7 +116,7 @@ shapes are correctness diagnostics rather than final performance claims.
 
 Date: 2026-08-29
 
-The final adapter now uses `triton_gluon_attention.py` on FP16 Blackwell
+The final adapter now uses `model/triton_gluon_attention.py` on FP16 Blackwell
 (`compute capability 12.x`) for exact power-of-two sequence lengths 32, 64,
 and 128. Each CTA owns a query tile and batch/head pair. Gluon `mma_v2`
 performs both QK and P@V, while the score mask, `libdevice.exp`, and a custom
@@ -159,21 +159,47 @@ fallback; their smoke timings are not used for the headline speed claim.
 
 Date: 2026-08-29
 
-Added `benchmark_shape_matrix.py`, `run_benchmark_matrix.py`,
-`benchmark_log_parser.py`, and `visualize_benchmark_matrix.py` to execute the
-14 Appendix 3.7 configurations through the unchanged official evaluator. The
-runner stores each command, raw evaluator log, parsed result, manifest, CSV,
-and JSON summary under `--output-dir`; plots include only cases that pass the
-official accuracy gate. `--resume` checks the benchmark hash, evaluator flags,
-shape list, and preflight settings before reusing a result.
+Added `tools/benchmark_shape_matrix.py`, `tools/run_benchmark_matrix.py`,
+`tools/benchmark_log_parser.py`, and `tools/visualize_benchmark_matrix.py` to
+execute the 14 Appendix 3.7 configurations through the unchanged official
+evaluator. The runner stores each command, raw evaluator log, parsed result,
+manifest, CSV, and JSON summary under `--output-dir`; plots include only cases
+that pass the official accuracy gate. `--resume` checks the benchmark hash,
+evaluator flags, shape list, and preflight settings before reusing a result.
 
 The runner preflights the `B=32, S=100000, D=1024, H=16` case because the
 baseline's dense `[B,H,S,S]` score tensor requires at least 10.24 TB in FP16;
 `--force-unsafe-shapes` explicitly bypasses that safety check. A one-trial GPU
 smoke run of case 1 recorded the existing optimized-model mismatch (1 failed
 element, maximum absolute error `0.0078125`) and correctly skipped timing.
-Exact smoke command: `.venv/bin/python run_benchmark_matrix.py --case 1
+Exact smoke command: `.venv/bin/python tools/run_benchmark_matrix.py --case 1
 --device cuda --dtype float16 --accuracy-trials 1 --warmup 1 --repeats 1
 --benchmark-rounds 1 --output-dir /tmp/techjam-matrix-gpu-smoke`. Environment:
 NVIDIA GeForce RTX 5070 Ti, PyTorch 2.13.0+cu130. Raw output is preserved at
 `/tmp/techjam-matrix-gpu-smoke/cases/case-01/raw.log`.
+
+## Repository organization
+
+Date: 2026-08-29
+
+The organizer-owned `torch_transformer_benchmark.py` remains at the repository
+root. Kernel implementations now live in `model/`, tests in `test/`, benchmark
+orchestration in `tools/`, generated outputs in `results/`, and documentation
+in `docs/`. Only the editable `UserOptimizedTransformer` imports changed in the
+official harness; the integrity checker continued to pass after the move.
+
+Structural validation used the full 19-test suite, Python compilation, and a
+real case-2 GPU smoke run through the relocated runner:
+
+```bash
+python3 tools/check_benchmark_integrity.py
+.venv/bin/python -m unittest discover -v
+.venv/bin/python tools/run_benchmark_matrix.py --case 2 --device cuda \
+  --dtype float16 --accuracy-trials 1 --warmup 1 --repeats 1 \
+  --benchmark-rounds 1 --output-dir /tmp/techjam-reorg-gpu-smoke
+python3 tools/check_benchmark_integrity.py
+```
+
+The smoke run passed all 16,384 output elements on the NVIDIA GeForce RTX 5070
+Ti with PyTorch 2.13.0+cu130. Its one-repeat timing is only a wiring diagnostic,
+not a performance claim.

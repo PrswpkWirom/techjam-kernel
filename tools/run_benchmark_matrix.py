@@ -20,17 +20,27 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
-from benchmark_log_parser import evaluation_status, parse_benchmark_log
-from benchmark_shape_matrix import (
-    ANNOUNCED_CASES,
-    ShapeCase,
-    format_bytes,
-    parse_case_ids,
-    select_cases,
-)
+if __package__:
+    from .benchmark_log_parser import evaluation_status, parse_benchmark_log
+    from .benchmark_shape_matrix import (
+        ANNOUNCED_CASES,
+        ShapeCase,
+        format_bytes,
+        parse_case_ids,
+        select_cases,
+    )
+else:
+    from benchmark_log_parser import evaluation_status, parse_benchmark_log
+    from benchmark_shape_matrix import (
+        ANNOUNCED_CASES,
+        ShapeCase,
+        format_bytes,
+        parse_case_ids,
+        select_cases,
+    )
 
 
-REPO_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = Path(__file__).resolve().parents[1]
 BENCHMARK_PATH = REPO_ROOT / "torch_transformer_benchmark.py"
 INTEGRITY_CHECKER = REPO_ROOT / "tools" / "check_benchmark_integrity.py"
 DEFAULT_DENSE_ATTENTION_LIMIT_BYTES = 64 * 1024**3
@@ -370,7 +380,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     output_dir = args.output_dir
     if output_dir is None:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        output_dir = REPO_ROOT / "benchmark-results" / f"run-{stamp}"
+        output_dir = REPO_ROOT / "results" / f"run-{stamp}"
     output_dir = output_dir.expanduser().resolve()
     if output_dir.exists() and any(output_dir.iterdir()) and not args.resume and not args.dry_run:
         raise SystemExit(f"output directory is not empty; use --resume: {output_dir}")

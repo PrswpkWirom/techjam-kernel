@@ -217,4 +217,7 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 triton_results.txt
-benchmark-results/
+results/*
+!results/.gitkeep
+!docs/
+!docs/*.md

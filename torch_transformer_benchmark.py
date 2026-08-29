@@ -182,8 +182,8 @@ class UserOptimizedTransformer(BaselineTransformer):
       2. Return a tensor with shape [batch_size, seq_len, d_model].
       3. Keep compatible parameter names, or customize copy_model_weights().
     """
-    from triton_softmax import TritonSelfAttention
-    from triton_fused_attention import TritonFusedSelfAttention
+    from model.triton_softmax import TritonSelfAttention
+    from model.triton_fused_attention import TritonFusedSelfAttention
 
     # Manually select the attention implementation here. The selected class must
     # accept (d_model, num_heads) and expose baseline-compatible parameters.

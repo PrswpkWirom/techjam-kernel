@@ -16,7 +16,7 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-from triton_gluon_attention import triton_gluon_full_attention
+from .triton_gluon_attention import triton_gluon_full_attention
 
 
 _SUPPORTED_HEAD_DIMS = (16, 32, 64, 128)

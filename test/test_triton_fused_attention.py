@@ -5,8 +5,11 @@ import unittest
 
 import torch
 
-from triton_fused_attention import TritonFusedSelfAttention, triton_fused_attention
-from triton_softmax import TritonSelfAttention, triton_attention_softmax
+from model.triton_fused_attention import (
+    TritonFusedSelfAttention,
+    triton_fused_attention,
+)
+from model.triton_softmax import TritonSelfAttention, triton_attention_softmax
 
 
 def _reference_attention(
