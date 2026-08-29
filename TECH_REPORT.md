@@ -154,3 +154,26 @@ Shape/mask checks also passed with the official tolerance: FP16 `S=64` padded,
 FP16 causal padded `S=97`, FP16 padded `S=33`, FP16 causal `S=32`, and BF16
 fallback. The partial-length cases intentionally dispatch to the correctness
 fallback; their smoke timings are not used for the headline speed claim.
+
+## Published shape-matrix test tooling
+
+Date: 2026-08-29
+
+Added `benchmark_shape_matrix.py`, `run_benchmark_matrix.py`,
+`benchmark_log_parser.py`, and `visualize_benchmark_matrix.py` to execute the
+14 Appendix 3.7 configurations through the unchanged official evaluator. The
+runner stores each command, raw evaluator log, parsed result, manifest, CSV,
+and JSON summary under `--output-dir`; plots include only cases that pass the
+official accuracy gate. `--resume` checks the benchmark hash, evaluator flags,
+shape list, and preflight settings before reusing a result.
+
+The runner preflights the `B=32, S=100000, D=1024, H=16` case because the
+baseline's dense `[B,H,S,S]` score tensor requires at least 10.24 TB in FP16;
+`--force-unsafe-shapes` explicitly bypasses that safety check. A one-trial GPU
+smoke run of case 1 recorded the existing optimized-model mismatch (1 failed
+element, maximum absolute error `0.0078125`) and correctly skipped timing.
+Exact smoke command: `.venv/bin/python run_benchmark_matrix.py --case 1
+--device cuda --dtype float16 --accuracy-trials 1 --warmup 1 --repeats 1
+--benchmark-rounds 1 --output-dir /tmp/techjam-matrix-gpu-smoke`. Environment:
+NVIDIA GeForce RTX 5070 Ti, PyTorch 2.13.0+cu130. Raw output is preserved at
+`/tmp/techjam-matrix-gpu-smoke/cases/case-01/raw.log`.
