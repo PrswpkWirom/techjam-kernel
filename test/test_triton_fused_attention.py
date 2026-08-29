@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import math
 import unittest
+from unittest import mock
 
 import torch
 
 from model.triton_fused_attention import (
     TritonFusedSelfAttention,
     triton_fused_attention,
+    triton_fused_full_attention,
 )
 from model.triton_softmax import TritonSelfAttention, triton_attention_softmax
 
@@ -71,6 +73,164 @@ def _assert_official_tolerance(
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires a CUDA device")
 class TritonFusedAttentionTests(unittest.TestCase):
+    def test_gluon_full_fusion_all_dtypes_shapes_and_masks(self) -> None:
+        """Exercise the production Gluon seam, not the legacy Triton kernel."""
+        cases = (
+            (32, 16),
+            (32, 32),
+            (64, 32),
+            (128, 32),
+            (32, 64),
+            (64, 64),
+            (128, 64),
+            (32, 128),
+        )
+        for dtype in (torch.float16, torch.bfloat16, torch.float32):
+            for seq_len, head_dim in cases:
+                for causal in (False, True):
+                    for with_mask in (False, True):
+                        with self.subTest(
+                            dtype=dtype,
+                            seq_len=seq_len,
+                            head_dim=head_dim,
+                            causal=causal,
+                            with_mask=with_mask,
+                        ):
+                            generator = torch.Generator(device="cuda").manual_seed(
+                                1000 + seq_len + head_dim + int(causal)
+                            )
+                            q = torch.randn(
+                                (1, 2, seq_len, head_dim),
+                                device="cuda",
+                                dtype=dtype,
+                                generator=generator,
+                            )
+                            k = torch.randn_like(q)
+                            v = torch.randn_like(q)
+                            valid_token_mask = None
+                            if with_mask:
+                                valid_token_mask = torch.arange(
+                                    seq_len, device="cuda"
+                                )[None, :] < max(1, seq_len // 2)
+
+                            expected = _reference_attention(
+                                q, k, v, valid_token_mask, causal
+                            )
+                            # A supported call must not silently use the nested
+                            # PyTorch fallback.  The plain-TF32 production
+                            # allowlist currently includes D_head=64 only;
+                            # FP32 D_head=32 remains a correctness fallback.
+                            if dtype != torch.float32 or head_dim == 64:
+                                with mock.patch(
+                                    "model.triton_gluon_attention.torch.matmul",
+                                    side_effect=AssertionError("unexpected fallback"),
+                                ):
+                                    actual = triton_fused_full_attention(
+                                        q,
+                                        k,
+                                        v,
+                                        valid_token_mask=valid_token_mask,
+                                        causal=causal,
+                                    )
+                            else:
+                                actual = triton_fused_full_attention(
+                                    q,
+                                    k,
+                                    v,
+                                    valid_token_mask=valid_token_mask,
+                                    causal=causal,
+                                )
+                            _assert_official_tolerance(actual, expected)
+
+    def test_fused_adapter_dispatches_bfloat16_and_float32_to_gluon(self) -> None:
+        """The adapter must enter the full-fusion seam for supported dtypes."""
+        for dtype in (torch.bfloat16, torch.float32):
+            with self.subTest(dtype=dtype):
+                torch.manual_seed(7000)
+                candidate = TritonFusedSelfAttention(d_model=128, num_heads=2)
+                candidate = candidate.cuda().to(dtype).eval()
+                x = torch.randn((1, 32, 128), device="cuda", dtype=dtype)
+                valid_token_mask = torch.ones(
+                    (1, 32), device="cuda", dtype=torch.bool
+                )
+                with mock.patch(
+                    "model.triton_fused_attention._reference_attention",
+                    side_effect=AssertionError("unexpected adapter fallback"),
+                ), mock.patch(
+                    "model.triton_gluon_attention.torch.matmul",
+                    side_effect=AssertionError("unexpected Gluon fallback"),
+                ):
+                    with torch.inference_mode():
+                        output = candidate(x, valid_token_mask)
+                self.assertEqual(output.shape, x.shape)
+                self.assertEqual(output.dtype, dtype)
+
+    def test_full_attention_fallback_matches_contiguous_reference_all_dtypes(self) -> None:
+        """Unsupported sequence lengths retain the baseline operation order."""
+        for dtype in (torch.float16, torch.bfloat16, torch.float32):
+            for seq_len, head_dim in ((33, 32), (32, 8), (32, 256), (1024, 32)):
+                with self.subTest(dtype=dtype, seq_len=seq_len, head_dim=head_dim):
+                    q = torch.randn(
+                        (2, 2, seq_len, head_dim), device="cuda", dtype=dtype
+                    )
+                    k = torch.randn_like(q)
+                    v = torch.randn_like(q)
+                    valid_token_mask = torch.arange(
+                        seq_len, device="cuda"
+                    )[None, :] < torch.tensor(
+                        [seq_len, max(1, seq_len // 2)], device="cuda"
+                    )[:, None]
+                    expected = _reference_attention(
+                        q, k, v, valid_token_mask, causal=True
+                    )
+                    actual = triton_fused_full_attention(
+                        q, k, v, valid_token_mask=valid_token_mask, causal=True
+                    )
+                    _assert_official_tolerance(actual, expected)
+
+    def test_fused_adapter_six_layer_tolerance_all_dtypes(self) -> None:
+        """Small deterministic stacks catch dtype drift that one layer hides."""
+        from torch_transformer_benchmark import (
+            BaselineTransformer,
+            TransformerConfig,
+            copy_model_weights,
+            generate_random_case,
+        )
+
+        for dtype in (torch.float16, torch.bfloat16, torch.float32):
+            with self.subTest(dtype=dtype):
+                config = TransformerConfig(
+                    batch_size=2,
+                    seq_len=32,
+                    d_model=128,
+                    num_heads=2,
+                    ffn_dim=256,
+                    num_layers=6,
+                    causal=True,
+                )
+                torch.manual_seed(8080)
+                baseline = BaselineTransformer(config)
+                candidate = BaselineTransformer(config)
+                for layer in candidate.layers:
+                    layer.attention = TritonFusedSelfAttention(
+                        config.d_model, config.num_heads
+                    )
+                copy_model_weights(baseline, candidate)
+                baseline = baseline.cuda().to(dtype).eval()
+                candidate = candidate.cuda().to(dtype).eval()
+                x, valid_token_mask = generate_random_case(
+                    config=config,
+                    device=torch.device("cuda"),
+                    dtype=dtype,
+                    seed=8080,
+                    padding_ratio=0.25,
+                    input_scale=1.0,
+                )
+                with torch.inference_mode():
+                    expected = baseline(x, valid_token_mask)
+                    actual = candidate(x, valid_token_mask)
+                _assert_official_tolerance(actual, expected)
+
     def _assert_experimental_single_layer_implementations(
         self,
         q: torch.Tensor,

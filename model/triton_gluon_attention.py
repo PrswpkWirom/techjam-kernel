@@ -16,23 +16,41 @@ from triton.language.extra import libdevice
 _SUPPORTED_HEAD_DIMS = (16, 32, 64, 128)
 _SUPPORTED_SEQUENCE_LENGTHS = (32, 64, 128)
 _SUPPORTED_WARPS = (1, 2, 4, 8)
+_FP32_FUSED_HEAD_DIMS = (64,)
+
+# These values are deliberately compile-time kernel modes.  Keeping the mode
+# out of the element-wise dataflow lets Gluon emit one specialization per
+# model dtype while sharing the QK/mask/softmax/PV implementation.
+FP16_MODE = gl.constexpr(0)
+BF16_MODE = gl.constexpr(1)
+FP32_TF32_MODE = gl.constexpr(2)
 
 
 @gluon.jit
-def _mma(a, b, M: gl.constexpr, K: gl.constexpr, N: gl.constexpr):
+def _mma(
+    a, b, M: gl.constexpr, K: gl.constexpr, N: gl.constexpr,
+    INPUT_PRECISION: gl.constexpr,
+):
+    # This is the same operand packing rule used by Triton's own
+    # Triton-to-Gluon translator.  FP16/BF16 consume two 16-bit values per
+    # 32-bit register lane; FP32 consumes one.
+    a_bitwidth: gl.constexpr = a.type.element_ty.primitive_bitwidth
+    b_bitwidth: gl.constexpr = b.type.element_ty.primitive_bitwidth
+    min_bitwidth: gl.constexpr = min(a_bitwidth, b_bitwidth)
+    k_width: gl.constexpr = max(32 // min_bitwidth, 1)
     mma_layout: gl.constexpr = gl.NVMMADistributedLayout(
         version=[2, 0], warps_per_cta=[gl.num_warps(), 1], instr_shape=[16, 8]
     )
     a_layout: gl.constexpr = gl.DotOperandLayout(
-        parent=mma_layout, operand_index=0, k_width=2
+        parent=mma_layout, operand_index=0, k_width=k_width
     )
     b_layout: gl.constexpr = gl.DotOperandLayout(
-        parent=mma_layout, operand_index=1, k_width=2
+        parent=mma_layout, operand_index=1, k_width=k_width
     )
     a = gl.convert_layout(a, a_layout)
     b = gl.convert_layout(b, b_layout)
     acc = gl.zeros([M, N], gl.float32, layout=mma_layout)
-    return mma_v2(a, b, acc)
+    return mma_v2(a, b, acc, input_precision=INPUT_PRECISION)
 
 
 @gluon.jit
@@ -52,6 +70,7 @@ def _kernel(
     scale: gl.constexpr, HEAD_DIM: gl.constexpr,
     BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
     CAUSAL: gl.constexpr, HAS_MASK: gl.constexpr,
+    DTYPE_MODE: gl.constexpr, INPUT_PRECISION: gl.constexpr,
 ):
     qtile = gl.program_id(0)
     bh = gl.program_id(1)
@@ -88,9 +107,21 @@ def _kernel(
         + n[:, None] * stride_vs + d[None, :],
         mask=k_valid[:, None], other=0.0,
     )
-    scores = _mma(q, k.trans(), BLOCK_M, HEAD_DIM, BLOCK_N)
+    scores = _mma(
+        q, k.trans(), BLOCK_M, HEAD_DIM, BLOCK_N,
+        INPUT_PRECISION=INPUT_PRECISION,
+    )
     scores = gl.convert_layout(scores, parent_score)
-    scores = scores.to(gl.float16).to(gl.float32) * scale
+    if DTYPE_MODE == FP16_MODE:
+        scores = scores.to(gl.float16)
+        scores = (scores.to(gl.float32) * scale).to(gl.float16).to(gl.float32)
+    elif DTYPE_MODE == BF16_MODE:
+        scores = scores.to(gl.bfloat16)
+        scores = (scores.to(gl.float32) * scale).to(gl.bfloat16).to(gl.float32)
+    else:
+        # FP32 QK is intentionally not routed through a narrower dtype.  The
+        # MMA helper receives input_precision="tf32" for this specialization.
+        scores = scores * scale
     included = q_valid_score[:, None] & k_valid_score[None, :]
     if CAUSAL:
         included = included & (score_n[None, :] <= score_m[:, None])
@@ -108,14 +139,24 @@ def _kernel(
     denominator = gl.reduce(numerator, axis=1, combine_fn=_add_rn)
     denominator = gl.convert_layout(denominator, parent_1d_score_m)
     denominator = gl.where(denominator > 0.0, denominator, 1.0)
-    probabilities = libdevice.div_rn(
-        numerator, denominator[:, None]
-    ).to(gl.float16)
+    probabilities = libdevice.div_rn(numerator, denominator[:, None])
+    if DTYPE_MODE == FP16_MODE:
+        probabilities = probabilities.to(gl.float16)
+    elif DTYPE_MODE == BF16_MODE:
+        probabilities = probabilities.to(gl.bfloat16)
     probabilities = gl.convert_layout(probabilities, parent_score)
     values = gl.convert_layout(v, parent_k)
-    accumulator = _mma(probabilities, values, BLOCK_M, BLOCK_N, HEAD_DIM)
+    accumulator = _mma(
+        probabilities, values, BLOCK_M, BLOCK_N, HEAD_DIM,
+        INPUT_PRECISION=INPUT_PRECISION,
+    )
     accumulator = gl.convert_layout(accumulator, parent_q)
-    out = accumulator.to(gl.float16)
+    if DTYPE_MODE == FP16_MODE:
+        out = accumulator.to(gl.float16)
+    elif DTYPE_MODE == BF16_MODE:
+        out = accumulator.to(gl.bfloat16)
+    else:
+        out = accumulator
     gl.store(
         out_ptr + batch * stride_ob + head * stride_oh
         + m[:, None] * stride_os + d[None, :],
@@ -166,7 +207,13 @@ def triton_gluon_full_attention(
         raise ValueError("scale must be positive")
 
     def reference() -> torch.Tensor:
-        scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+        # BaselineSelfAttention materializes contiguous [B,H,S,D] views before
+        # its QK/PV matmuls.  Keep this copy strictly on the fallback path; the
+        # fused kernel consumes the original strides directly.
+        q_ref = q.contiguous()
+        k_ref = k.contiguous()
+        v_ref = v.contiguous()
+        scores = torch.matmul(q_ref, k_ref.transpose(-2, -1)) * scale
         if causal:
             causal_mask = torch.ones(
                 (sequence_length, sequence_length),
@@ -177,18 +224,19 @@ def triton_gluon_full_attention(
         if mask is not None:
             scores = scores.masked_fill(~mask[:, None, None, :], float("-inf"))
         probabilities = torch.softmax(scores.float(), dim=-1).to(q.dtype)
-        result = torch.matmul(probabilities, v)
+        result = torch.matmul(probabilities, v_ref)
         return result.transpose(1, 2).contiguous() if output_bshd else result
 
-    # Gluon's current mma_v2 lowering is intentionally restricted to the
-    # tested Blackwell FP16 tiles.  Partial sequence lengths use the reference
-    # to avoid changing the baseline's reduction/rounding behavior.
+    # Gluon's mma_v2 lowering is intentionally restricted to the validated
+    # Blackwell tile envelope. Partial sequence lengths use the reference to
+    # avoid changing the baseline's reduction/rounding behavior.
     supported = (
         q.device.type == "cuda"
-        and q.dtype == torch.float16
+        and q.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and (q.dtype != torch.float32 or head_dim in _FP32_FUSED_HEAD_DIMS)
         and head_dim in _SUPPORTED_HEAD_DIMS
         and sequence_length in _SUPPORTED_SEQUENCE_LENGTHS
-        and block_m in (32, 64, 128)
+        and block_m in (16, 32, 64, 128)
         and block_n in (32, 64, 128)
         and block_n >= sequence_length
         and num_warps in _SUPPORTED_WARPS
@@ -223,6 +271,15 @@ def triton_gluon_full_attention(
     else:
         smb, sms = mask.stride(0), mask.stride(1)
         hm = True
+    if q.dtype == torch.float16:
+        dtype_mode = FP16_MODE
+        input_precision = None
+    elif q.dtype == torch.bfloat16:
+        dtype_mode = BF16_MODE
+        input_precision = None
+    else:
+        dtype_mode = FP32_TF32_MODE
+        input_precision = "tf32"
     _kernel[((q.shape[2] + block_m - 1) // block_m, q.shape[0] * q.shape[1])](
         q, k, v, out, mask,
         q.stride(0), q.stride(1), q.stride(2),
@@ -232,6 +289,7 @@ def triton_gluon_full_attention(
         smb, sms,
         num_heads=q.shape[1], sequence_length=q.shape[2], scale=scale,
         HEAD_DIM=q.shape[-1], BLOCK_M=block_m, BLOCK_N=block_n, CAUSAL=causal, HAS_MASK=hm,
+        DTYPE_MODE=dtype_mode, INPUT_PRECISION=input_precision,
         num_warps=num_warps,
     )
     return out

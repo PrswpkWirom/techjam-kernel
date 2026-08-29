@@ -203,3 +203,57 @@ python3 tools/check_benchmark_integrity.py
 The smoke run passed all 16,384 output elements on the NVIDIA GeForce RTX 5070
 Ti with PyTorch 2.13.0+cu130. Its one-repeat timing is only a wiring diagnostic,
 not a performance claim.
+
+## BF16 and FP32 Gluon full-fusion extension
+
+Date: 2026-08-29
+
+The Gluon MMA adapter is now dtype-specialized behind the same full-row
+QK/softmax/PV kernel. `_mma` derives operand `k_width` from the input primitive
+bit widths (`2` for FP16/BF16 and `1` for FP32) and forwards a compile-time MMA
+precision. FP16 and BF16 round QK and scaled scores at the model-dtype
+boundaries, keep softmax state in FP32, round probabilities immediately before
+PV, and store the model dtype. FP32 keeps all state in FP32 and uses
+`input_precision="tf32"` for both MMA operations.
+
+Reference-only execution now makes Q/K/V contiguous, matching
+`BaselineSelfAttention`; the fused path still consumes the original
+transposed strides and writes `[B,S,H,D]` directly.
+
+On the NVIDIA GeForce RTX 5070 Ti with PyTorch 2.13.0+cu130, the headline
+`B=256,S=128,D=512,H=8,L=6` case passed all 83,886,080 elements for each dtype:
+
+| dtype | baseline median | optimized median | speedup | max abs | failures |
+|---|---:|---:|---:|---:|---:|
+| FP16 | 39.1447 ms | 25.4351 ms | 1.539x | 0 | 0 |
+| BF16 | 39.1312 ms | 25.5070 ms | 1.534x | 0 | 0 |
+| FP32/TF32 | 67.8260 ms | 53.0044 ms | 1.280x | 0.00118494 | 0 |
+
+FP16 and BF16 remained fused for the current exact tile envelope: sequence
+lengths 32/64/128 and head dimensions 16/32/64/128. Partial/long sequences and
+head dimensions 8/256 use the contiguous reference fallback. Plain TF32 was
+correct for the common head-dimension-64 path. D_head=32 and D_head=128 each
+occasionally exceeded the strict 0.002 absolute threshold by one element after
+the residual stack, so those FP32 shapes are correctness-gated to fallback.
+
+The requested FP32 alternatives were tested and rejected on this Triton build:
+`tf32x3` and `ieee` report unsupported MMA versions on Blackwell `mma_v2`.
+An explicit Gluon denominator-tree port also cannot compile with the FP32
+distributed layout's SplitOp/reshape constraints. The existing Gluon reduction
+is retained for passing modes.
+
+Validation performed:
+
+```bash
+python3 tools/check_benchmark_integrity.py
+.venv/bin/python -m unittest -v test.test_triton_fused_attention
+.venv/bin/python -m py_compile model/triton_gluon_attention.py \
+  model/triton_fused_attention.py test/test_triton_fused_attention.py \
+  torch_transformer_benchmark.py
+```
+
+All announced cases 1–13 passed three-trial accuracy smoke runs for FP16, BF16,
+and FP32. Core cases 1/9/12 passed 20-trial checks for FP16/BF16; FP32 case 10
+(D_head=64) passed 20 trials with its performance run. Case 14 remains
+preflight-blocked because the protected dense baseline would require tens of
+terabytes for its `[B,H,S,S]` tensor.

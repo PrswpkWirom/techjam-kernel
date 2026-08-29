@@ -1,9 +1,9 @@
 """Triton attention kernels for the Transformer benchmark.
 
-The Blackwell FP16 path uses a one-program Gluon kernel: QK, masked softmax,
-and P@V all stay on chip, with Gluon's MMA lowering preserving the baseline
-FP16 GEMM rounding. Other dtypes/devices/shapes use the value-equivalent
-PyTorch fallback.
+The Blackwell full-row Gluon kernel keeps QK, masked softmax, and P@V on chip.
+FP16/BF16 use model-dtype score/probability boundaries; FP32 uses TF32 MMA
+with FP32 softmax and accumulation. Unsupported devices/shapes and autograd
+execution use the value-equivalent PyTorch fallback.
 """
 
 from __future__ import annotations
@@ -16,7 +16,10 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-from .triton_gluon_attention import triton_gluon_full_attention
+from .triton_gluon_attention import (
+    _FP32_FUSED_HEAD_DIMS,
+    triton_gluon_full_attention,
+)
 
 
 _SUPPORTED_HEAD_DIMS = (16, 32, 64, 128)
@@ -758,7 +761,13 @@ def _reference_attention(
 ) -> torch.Tensor:
     """Value-equivalent fallback matching the organizer's operation order."""
     sequence_length = q.shape[2]
-    scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+    # BaselineSelfAttention makes its split-head views contiguous.  Match that
+    # layout only for reference execution; the fused adapter intentionally
+    # keeps transposed Q/K/V views and consumes their strides directly.
+    q_ref = q.contiguous()
+    k_ref = k.contiguous()
+    v_ref = v.contiguous()
+    scores = torch.matmul(q_ref, k_ref.transpose(-2, -1)) * scale
     if causal:
         causal_mask = torch.ones(
             (sequence_length, sequence_length),
@@ -771,7 +780,7 @@ def _reference_attention(
             ~valid_token_mask[:, None, None, :], float("-inf")
         )
     probabilities = torch.softmax(scores.float(), dim=-1).to(q.dtype)
-    return torch.matmul(probabilities, v)
+    return torch.matmul(probabilities, v_ref)
 
 
 def _launch_configuration(
@@ -785,6 +794,28 @@ def _launch_configuration(
         # operands Tensor-Core friendly without the register pressure of 128x64.
         return 64, 64, 4, 3
     return 32, 32, 4, 2
+
+
+def _gluon_launch_configuration(
+    dtype: torch.dtype, sequence_length: int, head_dim: int
+) -> tuple[int, int]:
+    """Return fixed, offline-tuned (BLOCK_M, warps) choices for Gluon.
+
+    FP16/BF16 retain the established four-warp launch.  FP32 uses smaller
+    query tiles for lower-dimensional heads and a 64-row tile for the common
+    ``S=128, D_head=64`` case, where the local sweep showed the best balance
+    of launch count and register pressure.  This is intentionally a plain
+    lookup, not runtime autotuning in the timed path.
+    """
+    if dtype == torch.float32:
+        if sequence_length <= 32:
+            return 16, 4
+        if sequence_length <= 64:
+            return (16 if head_dim <= 32 else 32), 4
+        return (32 if head_dim <= 32 else 64), 4
+    if sequence_length <= 32:
+        return 32, 4
+    return 64, 4
 
 
 def triton_fused_attention(
@@ -804,10 +835,6 @@ def triton_fused_attention(
     if scale <= 0.0:
         raise ValueError("scale must be positive")
 
-    # The experimental bf16/float32 dot paths do not yet meet the organizer's
-    # strict per-element gate across random partial tiles. Keep the optimized
-    # kernel focused on its validated fp16 contract and preserve correctness
-    # for the other advertised dtypes.
     if (
         q.device.type != "cuda"
         or q.dtype != torch.float16
@@ -889,10 +916,15 @@ def triton_fused_full_attention(
     block_n = triton.next_power_of_2(sequence_length)
     if (
         q.device.type != "cuda"
-        or q.dtype != torch.float16
+        or q.dtype not in _SUPPORTED_DTYPES
         or sequence_length > 128
         or sequence_length not in (32, 64, 128)
         or head_dim not in _SUPPORTED_HEAD_DIMS
+        # Plain TF32 is within the gate for the common D_head=64 path.  The
+        # other FP32 head sizes can differ by just over the strict absolute
+        # threshold after several residual layers, so they stay on the exact
+        # fallback until a stronger reduction-matching MMA path is available.
+        or (q.dtype == torch.float32 and head_dim not in _FP32_FUSED_HEAD_DIMS)
         or block_n not in (32, 64, 128)
         or torch.cuda.get_device_capability(q.device)[0] < 12
         or (torch.is_grad_enabled() and (q.requires_grad or k.requires_grad or v.requires_grad))
@@ -902,17 +934,9 @@ def triton_fused_full_attention(
             return output.transpose(1, 2).contiguous()
         return output
 
-    if sequence_length <= 32:
-        block_m = 32
-        num_warps = 4
-    elif sequence_length <= 64:
-        block_m = 64
-        num_warps = 4
-    else:
-        block_m = 64
-        # Two 64-row programs per head expose more independent work than a
-        # single 128-row program and reduce register pressure on Blackwell.
-        num_warps = 4
+    block_m, num_warps = _gluon_launch_configuration(
+        q.dtype, sequence_length, head_dim
+    )
     return triton_gluon_full_attention(
         q,
         k,
@@ -1052,10 +1076,14 @@ class TritonFusedSelfAttention(nn.Module):
         )
         can_use_fused_full_attention = (
             x.device.type == "cuda"
-            and x.dtype == torch.float16
+            and x.dtype in _SUPPORTED_DTYPES
             and sequence_length <= 128
             and sequence_length in (32, 64, 128)
             and self.head_dim in _SUPPORTED_HEAD_DIMS
+            and (
+                x.dtype != torch.float32
+                or self.head_dim in _FP32_FUSED_HEAD_DIMS
+            )
             and not needs_autograd
         )
         if can_use_fused_full_attention:
