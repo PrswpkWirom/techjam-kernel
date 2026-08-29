@@ -189,6 +189,13 @@ class UserOptimizedTransformer(BaselineTransformer):
     # accept (d_model, num_heads) and expose baseline-compatible parameters.
     attention_class = TritonFusedSelfAttention
 
+    _LONG_SEQUENCE_LENGTH = 100_000
+    _LONG_SEQUENCE_BATCH = 32
+    _LONG_SEQUENCE_D_MODEL = 1024
+    _LONG_SEQUENCE_HEADS = 16
+    _LONG_SEQUENCE_FFN_DIM = 1024
+    _LONG_SEQUENCE_LAYERS = 2
+
     def __init__(self, config: TransformerConfig) -> None:
         super().__init__(config)
 
@@ -198,6 +205,72 @@ class UserOptimizedTransformer(BaselineTransformer):
             layer.attention = self.attention_class(
                 config.d_model, config.num_heads
             )
+
+    def _is_extreme_long_sequence_case(self, x: torch.Tensor) -> bool:
+        """Return whether the memory-sensitive competition case is active."""
+        return (
+            x.device.type == "cuda"
+            and x.dtype == torch.float16
+            and not torch.is_grad_enabled()
+            and x.ndim == 3
+            and x.shape[0] == self._LONG_SEQUENCE_BATCH
+            and x.shape[1] == self._LONG_SEQUENCE_LENGTH
+            and x.shape[2] == self._LONG_SEQUENCE_D_MODEL
+            and self.config.batch_size == self._LONG_SEQUENCE_BATCH
+            and self.config.seq_len == self._LONG_SEQUENCE_LENGTH
+            and self.config.d_model == self._LONG_SEQUENCE_D_MODEL
+            and self.config.num_heads == self._LONG_SEQUENCE_HEADS
+            and self.config.ffn_dim == self._LONG_SEQUENCE_FFN_DIM
+            and self.config.num_layers == self._LONG_SEQUENCE_LAYERS
+            and self.config.causal
+        )
+
+    def _forward_extreme_long_sequence(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Run the complete stack one batch element at a time.
+
+        Keeping the microbatch boundary around the whole inherited forward is
+        important: Q/K/V, attention state, feed-forward intermediates, and
+        residuals from prior samples can all be released before the next sample
+        starts.  The destination is allocated once so the returned contract
+        remains exactly ``[B, S, D]``.
+        """
+        if valid_token_mask is not None:
+            if valid_token_mask.shape != x.shape[:2]:
+                raise ValueError(
+                    "valid_token_mask must have shape "
+                    f"{tuple(x.shape[:2])}, got {tuple(valid_token_mask.shape)}"
+                )
+            if valid_token_mask.dtype != torch.bool:
+                raise TypeError("valid_token_mask must have dtype torch.bool")
+            if valid_token_mask.device != x.device:
+                raise ValueError("valid_token_mask and x must be on the same device")
+
+        output = torch.empty_like(x)
+        for batch_index in range(x.shape[0]):
+            sample_mask = (
+                None
+                if valid_token_mask is None
+                else valid_token_mask[batch_index : batch_index + 1]
+            )
+            sample_output = super().forward(
+                x[batch_index : batch_index + 1], sample_mask
+            )
+            output[batch_index : batch_index + 1].copy_(sample_output)
+            del sample_output
+        return output
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if self._is_extreme_long_sequence_case(x):
+            return self._forward_extreme_long_sequence(x, valid_token_mask)
+        return super().forward(x, valid_token_mask)
 
 
 def copy_model_weights(

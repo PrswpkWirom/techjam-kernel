@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import math
 import unittest
 from unittest import mock
@@ -299,6 +300,124 @@ class TritonFusedAttentionTests(unittest.TestCase):
         self._assert_experimental_single_layer_implementations(
             q, k, v, valid_token_mask=valid_token_mask, causal=True
         )
+
+    def test_tiled_attention_bshd_output_matches_bhsd_layout(self) -> None:
+        """The long path may write BSHD without changing the numerical result."""
+        torch.manual_seed(6123)
+        q = torch.randn((1, 2, 257, 64), device="cuda", dtype=torch.float16)
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+        with torch.inference_mode():
+            bhsd = triton_fused_attention(q, k, v, causal=True)
+            bshd = triton_fused_attention(
+                q, k, v, causal=True, output_bshd=True
+            )
+        self.assertEqual(tuple(bshd.shape), (1, 257, 2, 64))
+        self.assertTrue(bshd.is_contiguous())
+        self.assertTrue(torch.equal(bhsd.transpose(1, 2), bshd))
+
+    def test_long_tiled_attention_matches_reference_length_matrix(self) -> None:
+        """Exercise the competition tolerance at every planned probe length."""
+        for sequence_length in (257, 1024, 2048, 4096):
+            with self.subTest(sequence_length=sequence_length):
+                torch.manual_seed(61230 + sequence_length)
+                q = torch.randn(
+                    (1, 16, sequence_length, 64),
+                    device="cuda",
+                    dtype=torch.float16,
+                )
+                k = torch.randn_like(q)
+                v = torch.randn_like(q)
+                with torch.inference_mode():
+                    expected = _reference_attention(
+                        q, k, v, valid_token_mask=None, causal=True
+                    )
+                    actual = triton_fused_attention(q, k, v, causal=True)
+                _assert_official_tolerance(actual, expected)
+                del q, k, v, expected, actual
+                gc.collect()
+                torch.cuda.empty_cache()
+
+    def test_long_adapter_dispatches_to_tiled_attention(self) -> None:
+        """Causal FP16 D_head=64 lengths above the Gluon envelope stay tiled."""
+        torch.manual_seed(6124)
+        candidate = TritonFusedSelfAttention(128, 2).cuda().half().eval()
+        x = torch.randn((1, 257, 128), device="cuda", dtype=torch.float16)
+        valid_token_mask = torch.ones((1, 257), device="cuda", dtype=torch.bool)
+        with mock.patch(
+            "model.triton_fused_attention._reference_attention",
+            side_effect=AssertionError("unexpected dense long fallback"),
+        ):
+            with torch.inference_mode():
+                output = candidate(x, valid_token_mask, causal=True)
+        self.assertEqual(tuple(output.shape), tuple(x.shape))
+        self.assertEqual(output.dtype, x.dtype)
+        self.assertTrue(bool(torch.isfinite(output).all()))
+
+    def test_whole_model_microbatch_helper_matches_batched_execution(self) -> None:
+        """The helper preserves complete-stack semantics for each sample."""
+        from torch_transformer_benchmark import (
+            BaselineTransformer,
+            TransformerConfig,
+            UserOptimizedTransformer,
+            copy_model_weights,
+        )
+
+        config = TransformerConfig(
+            batch_size=2,
+            seq_len=33,
+            d_model=128,
+            num_heads=2,
+            ffn_dim=256,
+            num_layers=2,
+            causal=True,
+        )
+        torch.manual_seed(6125)
+        baseline = BaselineTransformer(config).cuda().half().eval()
+        candidate = UserOptimizedTransformer(config).cuda().half().eval()
+        copy_model_weights(baseline, candidate)
+        x = torch.randn((2, 33, 128), device="cuda", dtype=torch.float16)
+        valid_token_mask = torch.arange(33, device="cuda")[None, :] < torch.tensor(
+            [33, 19], device="cuda"
+        )[:, None]
+        with torch.inference_mode():
+            expected = baseline(x, valid_token_mask)
+            microbatched = candidate._forward_extreme_long_sequence(
+                x, valid_token_mask
+            )
+        _assert_official_tolerance(microbatched, expected)
+        self.assertTrue(bool((microbatched[1, 19:] == 0).all()))
+
+    def test_user_transformer_forward_routes_extreme_case_to_helper(self) -> None:
+        """The public forward keeps the microbatch decision in one seam."""
+        from torch_transformer_benchmark import (
+            TransformerConfig,
+            UserOptimizedTransformer,
+        )
+
+        config = TransformerConfig(
+            batch_size=2,
+            seq_len=33,
+            d_model=128,
+            num_heads=2,
+            ffn_dim=256,
+            num_layers=2,
+            causal=True,
+        )
+        candidate = UserOptimizedTransformer(config).cuda().half().eval()
+        x = torch.randn((2, 33, 128), device="cuda", dtype=torch.float16)
+        marker = torch.zeros_like(x)
+        with mock.patch.object(
+            candidate, "_is_extreme_long_sequence_case", return_value=True
+        ), mock.patch.object(
+            candidate,
+            "_forward_extreme_long_sequence",
+            return_value=marker,
+        ) as helper:
+            with torch.inference_mode():
+                output = candidate(x)
+        helper.assert_called_once_with(x, None)
+        self.assertIs(output, marker)
 
     def test_experimental_causal_attention_without_padding_mask(self) -> None:
         q = torch.randn((2, 2, 65, 64), device="cuda", dtype=torch.float16)

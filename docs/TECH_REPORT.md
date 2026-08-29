@@ -204,6 +204,49 @@ The smoke run passed all 16,384 output elements on the NVIDIA GeForce RTX 5070
 Ti with PyTorch 2.13.0+cu130. Its one-repeat timing is only a wiring diagnostic,
 not a performance claim.
 
+## Exact long-sequence path
+
+Date: 2026-08-30
+
+The existing tiled online-softmax Triton kernel is now the production attention
+path for CUDA FP16 causal inputs with `D_head=64` and `S>=257`. It keeps Q/K/V
+in transposed views, maintains FP32 online-softmax state, scans only through
+the causal query tile, and can write the final context directly as `[B,S,H,D]`.
+Its normalized running context is algebraically equivalent to the textbook
+`acc/l` recurrence while preserving the baseline-compatible FP16 probability
+rounding that passed the multi-layer tolerance checks.
+The established Gluon path for `S=32/64/128` remains unchanged; unsupported
+long dtypes, head dimensions, non-causal inputs, and autograd retain the
+reference fallback.
+
+The editable `UserOptimizedTransformer` seam recognizes the announced
+`B=32,S=100000,D=1024,H=16,FFN=1024,L=2,causal=True` FP16 inference case and
+runs the complete inherited Transformer one sample at a time. A single final
+`[B,S,D]` output is preallocated and filled with slice copies. No attention,
+score, probability, or causal tensor proportional to `S^2` is created.
+
+Validation commands:
+
+```bash
+python3 tools/check_benchmark_integrity.py
+.venv/bin/python -m unittest -v test.test_triton_fused_attention
+.venv/bin/python tools/smoke_long_sequence.py --seed 1234
+```
+
+On the NVIDIA GeForce RTX 5070 Ti (15.47 GiB, PyTorch 2.13.0+cu130), the
+optimized-only 100k smoke passed with output shape `(32, 100000, 1024)`,
+`torch.float16`, all finite values, runtime `25972.164 ms`, peak allocated
+memory `14127.2 MiB`, and peak reserved memory `14142.0 MiB`. A final rerun
+measured `26464.723 ms` with the same memory peaks and output properties.
+
+The protected official evaluator remains preflight-blocked for case 14 because
+its baseline necessarily allocates dense attention. Therefore this result is a
+memory/finite-output smoke test, not an official baseline comparison or
+speedup claim. The long path also passed the competition tolerance at
+`S=257,1024,2048,4096` for the two-layer D=1024 model with zero failed
+elements; maximum absolute errors were `0.00390625`, `0.00390625`,
+`0.00488281`, and `0.00488281`, respectively.
+
 ## BF16 and FP32 Gluon full-fusion extension
 
 Date: 2026-08-29

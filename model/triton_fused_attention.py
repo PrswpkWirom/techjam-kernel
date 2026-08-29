@@ -24,6 +24,7 @@ from .triton_gluon_attention import (
 
 _SUPPORTED_HEAD_DIMS = (16, 32, 64, 128)
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+_LONG_SEQUENCE_MIN_LENGTH = 257
 
 
 @triton.jit
@@ -130,7 +131,20 @@ def _fused_attention_forward_kernel(
 
         included = query_in_bounds[:, None] & key_in_bounds[None, :]
         if CAUSAL:
-            included &= key_offsets[None, :] <= query_offsets[:, None]
+            # The loop stops at the query tile's end, so every complete tile
+            # before the diagonal is already causal.  Keep the elementwise
+            # comparison only for the diagonal/tail tile.
+            if BLOCK_M == BLOCK_N:
+                diagonal_tile = key_start == query_tile * BLOCK_M
+                included &= tl.where(
+                    diagonal_tile,
+                    key_offsets[None, :] <= query_offsets[:, None],
+                    True,
+                )
+            else:
+                # Keep the general fallback correct if a future launch tune
+                # chooses rectangular query/key tiles.
+                included &= key_offsets[None, :] <= query_offsets[:, None]
 
         if HAS_VALID_TOKEN_MASK:
             key_is_valid = tl.load(
@@ -825,8 +839,14 @@ def triton_fused_attention(
     valid_token_mask: Optional[torch.Tensor] = None,
     causal: bool = False,
     scale: Optional[float] = None,
+    output_bshd: bool = False,
 ) -> torch.Tensor:
-    """Compute self-attention in one fused Triton kernel without SxS intermediates."""
+    """Compute tiled attention without materializing an S-by-S tensor.
+
+    ``output_bshd`` requests the contiguous ``[B, S, H, D]`` layout used by
+    the long-sequence model adapter.  The default preserves the historical
+    ``[B, H, S, D]`` API.
+    """
     batch, num_heads, sequence_length, head_dim = _validate_inputs(
         q, k, v, valid_token_mask
     )
@@ -844,9 +864,21 @@ def triton_fused_attention(
         or v.stride(-1) != 1
         or (torch.is_grad_enabled() and (q.requires_grad or k.requires_grad or v.requires_grad))
     ):
-        return _reference_attention(q, k, v, valid_token_mask, causal, scale)
+        output = _reference_attention(q, k, v, valid_token_mask, causal, scale)
+        if output_bshd:
+            return output.transpose(1, 2).contiguous()
+        return output
 
-    output = torch.empty_like(q)
+    if output_bshd:
+        output = torch.empty(
+            (batch, sequence_length, num_heads, head_dim),
+            device=q.device,
+            dtype=q.dtype,
+        )
+    else:
+        output = torch.empty_like(q)
+    output_stride_head = output.stride(1 if not output_bshd else 2)
+    output_stride_sequence = output.stride(2 if not output_bshd else 1)
     block_m, block_n, num_warps, num_stages = _launch_configuration(
         sequence_length, head_dim, causal
     )
@@ -876,8 +908,8 @@ def triton_fused_attention(
         v.stride(1),
         v.stride(2),
         output.stride(0),
-        output.stride(1),
-        output.stride(2),
+        output_stride_head,
+        output_stride_sequence,
         mask_stride_batch,
         mask_stride_sequence,
         num_heads=num_heads,
@@ -1032,7 +1064,7 @@ def triton_fused_qk_softmax_attention(
 
 
 class TritonFusedSelfAttention(nn.Module):
-    """Baseline-compatible adapter using Blackwell full-row attention."""
+    """Baseline-compatible adapter with short and long CUDA paths."""
 
     def __init__(self, d_model: int, num_heads: int) -> None:
         super().__init__()
@@ -1086,8 +1118,29 @@ class TritonFusedSelfAttention(nn.Module):
             )
             and not needs_autograd
         )
+        can_use_long_attention = (
+            x.device.type == "cuda"
+            and x.dtype == torch.float16
+            and causal
+            and sequence_length >= _LONG_SEQUENCE_MIN_LENGTH
+            and self.head_dim == 64
+            and not needs_autograd
+        )
         if can_use_fused_full_attention:
             context = triton_fused_full_attention(
+                q,
+                k,
+                v,
+                valid_token_mask=valid_token_mask,
+                causal=causal,
+                scale=self.scale,
+                output_bshd=True,
+            )
+            context = context.view(batch, sequence_length, self.d_model)
+        elif can_use_long_attention:
+            # The tiled kernel keeps Q/K/V in their transposed views and writes
+            # [B, S, H, D] directly, avoiding a large post-attention transpose.
+            context = triton_fused_attention(
                 q,
                 k,
                 v,
