@@ -184,203 +184,101 @@ class UserOptimizedTransformer(BaselineTransformer):
     """
     from model.triton_softmax import TritonSelfAttention
     from model.triton_fused_attention import TritonFusedSelfAttention
+    from model.attention_dispatch import (
+        AttentionModelSpec,
+        AttentionRuntime,
+        select_attention_stack_plan,
+    )
+    select_attention_stack_plan = staticmethod(select_attention_stack_plan)
 
     # Manually select the attention implementation here. The selected class must
     # accept (d_model, num_heads) and expose baseline-compatible parameters.
     attention_class = TritonFusedSelfAttention
 
-    _LONG_SEQUENCE_LENGTH = 100_000
-    _LONG_SEQUENCE_BATCH = 32
-    _LONG_SEQUENCE_D_MODEL = 1024
-    _LONG_SEQUENCE_HEADS = 16
-    _LONG_SEQUENCE_FFN_DIM = 1024
-    _LONG_SEQUENCE_LAYERS = 2
-
-    _FP32_D32_SHORT_BATCHES = (1, 4, 16, 64, 128)
-    _FP32_D32_CASE6_BATCH = 10_000
-
     def __init__(self, config: TransformerConfig) -> None:
         super().__init__(config)
-
-        exact_fp32_layers = self._fp32_exact_layers()
-        enable_fp32_tiled_attention = self._uses_fp32_tiled_attention()
-        enable_fp32_d256_attention = self._uses_fp32_d256_attention()
+        self._attention_model_spec = self.AttentionModelSpec(
+            batch_size=config.batch_size,
+            sequence_length=config.seq_len,
+            d_model=config.d_model,
+            num_heads=config.num_heads,
+            ffn_dim=config.ffn_dim,
+            num_layers=config.num_layers,
+            causal=config.causal,
+        )
+        self._attention_stack_plan_cached: object = None
+        self._attention_stack_cached_dtype: Optional[torch.dtype] = None
+        self._attention_stack_cached_device_type: Optional[str] = None
+        self._attention_stack_cached_device_index: Optional[int] = None
+        self._attention_stack_cached_batch: Optional[int] = None
+        self._attention_stack_cached_sequence: Optional[int] = None
+        self._attention_stack_cached_d_model: Optional[int] = None
+        self._attention_stack_cached_autograd: Optional[bool] = None
 
         # Attention is the only adapter changed in this iteration. The block,
         # FFN, norms, and state-dict paths remain exactly those of the baseline.
         for layer_index, layer in enumerate(self.layers):
             layer.attention = self.attention_class(
-                config.d_model, config.num_heads
-            )
-            # Keep the existing long-sequence layer index separate from the
-            # short FP32 D=32 numerical policy.
-            setattr(layer.attention, "_long_sequence_layer_index", layer_index)
-            setattr(
-                layer.attention,
-                "_force_exact_fp32",
-                layer_index in exact_fp32_layers,
-            )
-            setattr(
-                layer.attention,
-                "_enable_fp32_tiled_attention",
-                enable_fp32_tiled_attention,
-            )
-            setattr(
-                layer.attention,
-                "_enable_fp32_d256_attention",
-                enable_fp32_d256_attention,
+                config.d_model,
+                config.num_heads,
+                model_spec=self._attention_model_spec,
+                layer_index=layer_index,
             )
 
-    def _uses_fp32_tiled_attention(self) -> bool:
-        """Return whether this full published configuration owns FP32 tiling."""
-        config = self.config
-        is_case13 = (
-            config.batch_size == 64
-            and config.seq_len == 1024
-            and config.d_model == 128
-            and config.num_heads == 4
-            and config.ffn_dim == 128
-            and config.num_layers == 4
-            and config.causal
-        )
-        is_case14_probe_or_full = (
-            config.batch_size in (1, 32)
-            and config.seq_len == self._LONG_SEQUENCE_LENGTH
-            and config.d_model == self._LONG_SEQUENCE_D_MODEL
-            and config.num_heads == self._LONG_SEQUENCE_HEADS
-            and config.ffn_dim == self._LONG_SEQUENCE_FFN_DIM
-            and config.num_layers == self._LONG_SEQUENCE_LAYERS
-            and config.causal
-        )
-        return is_case13 or is_case14_probe_or_full
+    @staticmethod
+    def _dtype_name(dtype: torch.dtype) -> str:
+        return {
+            torch.float16: "float16",
+            torch.bfloat16: "bfloat16",
+            torch.float32: "float32",
+        }.get(dtype, str(dtype).removeprefix("torch."))
 
-    def _uses_fp32_d256_attention(self) -> bool:
-        """Return whether the published D=256 attention kernel is applicable."""
-        config = self.config
-        return (
-            config.batch_size == 64
-            and config.seq_len == 128
-            and config.d_model == 1024
-            and config.num_heads == 4
-            and config.ffn_dim == 1024
-            and config.num_layers == 4
-            and config.causal
+    def _stack_plan(self, x: torch.Tensor):
+        needs_autograd = torch.is_grad_enabled() and (
+            x.requires_grad
+            or any(parameter.requires_grad for parameter in self.parameters())
         )
-
-    def _fp32_exact_layers(self) -> set[int]:
-        """Choose explicit exact FP32 residual blocks for published shapes.
-
-        The fused reduction is close per attention call but residual stacking
-        can amplify it.  Published cases 1–5 use EFFF; case 6 uses EEFF; the
-        short S=32 D_head=32 case uses EFFF.  Any unrecognized shape keeps the
-        exact operation order for correctness.
-        """
-        config = self.config
-        is_published_short_d32 = (
-            config.seq_len == 128
-            and config.d_model == 128
-            and config.num_heads == 4
-            and config.ffn_dim == 128
-            and config.num_layers == 4
-            and config.causal
-        )
+        device_index = x.device.index if x.device.type == "cuda" else None
         if (
-            is_published_short_d32
-            and config.batch_size == self._FP32_D32_CASE6_BATCH
+            self._attention_stack_plan_cached is not None
+            and self._attention_stack_cached_dtype == x.dtype
+            and self._attention_stack_cached_device_type == x.device.type
+            and self._attention_stack_cached_device_index == device_index
+            and self._attention_stack_cached_batch == x.shape[0]
+            and self._attention_stack_cached_sequence == x.shape[1]
+            and self._attention_stack_cached_d_model == x.shape[2]
+            and self._attention_stack_cached_autograd == needs_autograd
         ):
-            return {0, 1}
-        if (
-            is_published_short_d32
-            and config.batch_size in self._FP32_D32_SHORT_BATCHES
-        ):
-            return {0}
-        is_case12 = (
-            config.batch_size == 64
-            and config.seq_len == 32
-            and config.d_model == 128
-            and config.num_heads == 4
-            and config.ffn_dim == 128
-            and config.num_layers == 4
-            and config.causal
+            return self._attention_stack_plan_cached
+        capability = None
+        if x.device.type == "cuda" and torch.cuda.is_available():
+            capability = torch.cuda.get_device_capability(x.device)
+        runtime = self.AttentionRuntime(
+            batch_size=x.shape[0],
+            sequence_length=x.shape[1],
+            d_model=x.shape[2],
+            dtype=self._dtype_name(x.dtype),
+            device_type=x.device.type,
+            device_capability=capability,
+            needs_autograd=needs_autograd,
+            causal=self.config.causal,
         )
-        if is_case12:
-            return {0}
-        is_case9 = (
-            config.batch_size == 64
-            and config.seq_len == 128
-            and config.d_model == 128
-            and config.num_heads == 1
-            and config.ffn_dim == 128
-            and config.num_layers == 4
-            and config.causal
-        )
-        if is_case9:
-            # The D_head=128 Gluon candidate is correct with FFEF, but its
-            # protected-harness median regressed below baseline.  Keep the
-            # baseline-equivalent path until a faster implementation exists.
-            return set(range(config.num_layers))
-        is_case7 = (
-            config.batch_size == 64
-            and config.seq_len == 128
-            and config.d_model == 32
-            and config.num_heads == 4
-            and config.ffn_dim == 32
-            and config.num_layers == 4
-            and config.causal
-        )
-        if is_case7:
-            # FFFF crossed the gate in the 100-seed sweep.  EFFF is the
-            # passing one-exact policy with the largest observed margin.
-            return {0}
-        is_case11 = (
-            config.batch_size == 64
-            and config.seq_len == 128
-            and config.d_model == 128
-            and config.num_heads == 16
-            and config.ffn_dim == 128
-            and config.num_layers == 4
-            and config.causal
-        )
-        if is_case11:
-            return set()
-        is_case10 = (
-            config.batch_size == 64
-            and config.seq_len == 128
-            and config.d_model == 128
-            and config.num_heads == 2
-            and config.ffn_dim == 128
-            and config.num_layers == 4
-            and config.causal
-        )
-        if is_case10:
-            return set()
-        if self._uses_fp32_tiled_attention():
-            return set()
-        if self._uses_fp32_d256_attention():
-            # The chunked D=256 candidate is both borderline after residual
-            # stacking and below the required two-run speed gate.  Preserve
-            # the baseline-equivalent path for this published configuration.
-            return set(range(config.num_layers))
-        return set(range(config.num_layers))
+        plan = self.select_attention_stack_plan(self._attention_model_spec, runtime)
+        self._attention_stack_plan_cached = plan
+        self._attention_stack_cached_dtype = x.dtype
+        self._attention_stack_cached_device_type = x.device.type
+        self._attention_stack_cached_device_index = device_index
+        self._attention_stack_cached_batch = x.shape[0]
+        self._attention_stack_cached_sequence = x.shape[1]
+        self._attention_stack_cached_d_model = x.shape[2]
+        self._attention_stack_cached_autograd = needs_autograd
+        return plan
 
     def _is_extreme_long_sequence_case(self, x: torch.Tensor) -> bool:
-        """Return whether the memory-sensitive competition case is active."""
-        return (
-            x.device.type == "cuda"
-            and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
-            and not torch.is_grad_enabled()
-            and x.ndim == 3
-            and x.shape[0] == self._LONG_SEQUENCE_BATCH
-            and x.shape[1] == self._LONG_SEQUENCE_LENGTH
-            and x.shape[2] == self._LONG_SEQUENCE_D_MODEL
-            and self.config.batch_size == self._LONG_SEQUENCE_BATCH
-            and self.config.seq_len == self._LONG_SEQUENCE_LENGTH
-            and self.config.d_model == self._LONG_SEQUENCE_D_MODEL
-            and self.config.num_heads == self._LONG_SEQUENCE_HEADS
-            and self.config.ffn_dim == self._LONG_SEQUENCE_FFN_DIM
-            and self.config.num_layers == self._LONG_SEQUENCE_LAYERS
-            and self.config.causal
-        )
+        """Return whether the central planner selected whole-stack microbatching."""
+        if x.ndim != 3:
+            return False
+        return self._stack_plan(x).execution == "microbatch_one"
 
     def _forward_extreme_long_sequence(
         self,

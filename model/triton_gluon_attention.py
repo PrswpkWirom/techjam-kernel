@@ -361,14 +361,15 @@ def triton_gluon_small_head_attention(
 def triton_gluon_full_attention(
     q, k, v, mask=None, causal=False, scale=None,
     block_m=128, block_n=None, num_warps=8, output_bshd=False,
+    strict=False,
 ):
     """Blackwell full-row attention using Gluon's register MMA path.
 
     This is an internal accelerator entry point, but it still owns its
-    dispatch boundary: malformed tensors raise a useful error, while valid
-    inputs outside the compiled Gluon contract use the exact PyTorch
-    operation-order fallback.  That keeps callers correct if the benchmark
-    adds a dtype, shape, or device that this kernel does not specialize.
+    validation boundary.  The compatibility default keeps the historical
+    exact fallback for direct callers; production dispatch passes
+    ``strict=True`` after the central planner has selected this mode, so an
+    invalid optimized invocation fails loudly instead of hiding a fallback.
     """
     if q.ndim != 4:
         raise ValueError(f"q must have shape [B, H, S, D], got {tuple(q.shape)}")
@@ -478,6 +479,8 @@ def triton_gluon_full_attention(
         )
     )
     if not supported:
+        if strict:
+            raise ValueError("unsupported strict Gluon full-row invocation")
         return reference()
 
     if output_bshd:

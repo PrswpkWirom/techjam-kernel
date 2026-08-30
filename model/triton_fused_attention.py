@@ -20,6 +20,13 @@ from .triton_gluon_attention import (
     _supports_fp32_fused_shape,
     triton_gluon_full_attention,
 )
+from .attention_dispatch import (
+    AttentionMode,
+    AttentionModelSpec,
+    AttentionRuntime,
+    PlanScope,
+    select_attention_stack_plan,
+)
 
 
 _SUPPORTED_HEAD_DIMS = (16, 32, 64, 128)
@@ -1543,6 +1550,11 @@ def _triton_fp32_tiled_attention(
     causal: bool,
     scale: float,
     output_bshd: bool = True,
+    *,
+    block_m: Optional[int] = None,
+    block_n: Optional[int] = None,
+    num_warps: Optional[int] = None,
+    num_stages: Optional[int] = None,
 ) -> torch.Tensor:
     """Run the strict FP32/TF32 tiled FlashAttention specialization.
 
@@ -1567,9 +1579,10 @@ def _triton_fp32_tiled_attention(
         raise ValueError("unsupported strict FP32 tiled-attention invocation")
     if scale <= 0.0:
         raise ValueError("scale must be positive")
-    block_m, block_n, num_warps, num_stages = _fp32_tiled_launch_configuration(
-        sequence_length, head_dim
-    )
+    if None in (block_m, block_n, num_warps, num_stages):
+        block_m, block_n, num_warps, num_stages = _fp32_tiled_launch_configuration(
+            sequence_length, head_dim
+        )
     if output_bshd:
         output = torch.empty(
             (batch, sequence_length, num_heads, head_dim),
@@ -1869,6 +1882,12 @@ def triton_fused_attention(
     causal: bool = False,
     scale: Optional[float] = None,
     output_bshd: bool = False,
+    *,
+    strict: bool = False,
+    block_m: Optional[int] = None,
+    block_n: Optional[int] = None,
+    num_warps: Optional[int] = None,
+    num_stages: Optional[int] = None,
 ) -> torch.Tensor:
     """Compute tiled attention without materializing an S-by-S tensor.
 
@@ -1884,7 +1903,7 @@ def triton_fused_attention(
     if scale <= 0.0:
         raise ValueError("scale must be positive")
 
-    if (
+    unsupported = (
         q.device.type != "cuda"
         or q.dtype not in _TILED_ATTENTION_DTYPES
         or (
@@ -1896,15 +1915,19 @@ def triton_fused_attention(
         or k.stride(-1) != 1
         or v.stride(-1) != 1
         or (torch.is_grad_enabled() and (q.requires_grad or k.requires_grad or v.requires_grad))
-    ):
+    )
+    if unsupported:
+        if strict:
+            raise ValueError("unsupported strict tiled-attention invocation")
         output = _reference_attention(q, k, v, valid_token_mask, causal, scale)
         if output_bshd:
             return output.transpose(1, 2).contiguous()
         return output
 
-    block_m, block_n, num_warps, num_stages = _launch_configuration(
-        q.dtype, sequence_length, head_dim, causal
-    )
+    if None in (block_m, block_n, num_warps, num_stages):
+        block_m, block_n, num_warps, num_stages = _launch_configuration(
+            q.dtype, sequence_length, head_dim, causal
+        )
     if (
         q.dtype == torch.float16
         and head_dim == 32
@@ -1987,6 +2010,11 @@ def triton_fused_full_attention(
     causal: bool = False,
     scale: Optional[float] = None,
     output_bshd: bool = False,
+    *,
+    strict: bool = False,
+    block_m: Optional[int] = None,
+    block_n: Optional[int] = None,
+    num_warps: Optional[int] = None,
 ) -> torch.Tensor:
     """Run the true full-row Blackwell-fused kernel for supported shapes."""
     batch, num_heads, sequence_length, head_dim = _validate_inputs(
@@ -1997,8 +2025,9 @@ def triton_fused_full_attention(
     if scale <= 0.0:
         raise ValueError("scale must be positive")
 
-    block_n = triton.next_power_of_2(sequence_length)
-    if (
+    if block_n is None:
+        block_n = triton.next_power_of_2(sequence_length)
+    unsupported = (
         q.device.type != "cuda"
         or q.dtype not in _SUPPORTED_DTYPES
         or sequence_length > 128
@@ -2022,18 +2051,23 @@ def triton_fused_full_attention(
         or block_n not in (32, 64, 128)
         or torch.cuda.get_device_capability(q.device)[0] < 12
         or (torch.is_grad_enabled() and (q.requires_grad or k.requires_grad or v.requires_grad))
-    ):
+    )
+    if unsupported:
+        if strict:
+            raise ValueError("unsupported strict full-row attention invocation")
         output = _reference_attention(q, k, v, valid_token_mask, causal, scale)
         if output_bshd:
             return output.transpose(1, 2).contiguous()
         return output
 
     if q.dtype == torch.float32 and sequence_length == 128 and head_dim == 8:
-        block_m, block_n, num_warps = _small_head_launch_configuration(num_heads)
+        if block_m is None or num_warps is None:
+            block_m, block_n, num_warps = _small_head_launch_configuration(num_heads)
     else:
-        block_m, num_warps = _gluon_launch_configuration(
-            q.dtype, sequence_length, head_dim
-        )
+        if block_m is None or num_warps is None:
+            block_m, num_warps = _gluon_launch_configuration(
+                q.dtype, sequence_length, head_dim
+            )
     return triton_gluon_full_attention(
         q,
         k,
@@ -2045,6 +2079,7 @@ def triton_fused_full_attention(
         block_n=block_n,
         num_warps=num_warps,
         output_bshd=output_bshd,
+        strict=strict,
     )
 
 
@@ -2131,7 +2166,14 @@ def triton_fused_qk_softmax_attention(
 class TritonFusedSelfAttention(nn.Module):
     """Baseline-compatible adapter with short and long CUDA paths."""
 
-    def __init__(self, d_model: int, num_heads: int) -> None:
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        *,
+        model_spec: Optional[AttentionModelSpec] = None,
+        layer_index: Optional[int] = None,
+    ) -> None:
         super().__init__()
         if d_model % num_heads != 0:
             raise ValueError("d_model must be divisible by num_heads")
@@ -2140,15 +2182,21 @@ class TritonFusedSelfAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
         self.scale = self.head_dim**-0.5
-        # UserOptimizedTransformer fills this for long-stack numerical policy.
-        self._long_sequence_layer_index: Optional[int] = None
-        # Model-level FP32 dispatch can force the exact operation order for
-        # selected residual blocks without changing public APIs.
-        self._force_exact_fp32 = False
-        # Long FP32 tiling remains disabled unless the model-level dispatcher
-        # has recognized one of its fully validated benchmark configurations.
-        self._enable_fp32_tiled_attention = False
-        self._enable_fp32_d256_attention = False
+        # The model supplies the complete configured shape and layer index.
+        # Standalone adapters synthesize a one-layer scope at call time, which
+        # preserves their historical generic-kernel behavior.
+        self._attention_model_spec = model_spec
+        self._attention_layer_index = layer_index
+        self._attention_cached_result: Optional[tuple[object, object]] = None
+        self._attention_cached_dtype: Optional[torch.dtype] = None
+        self._attention_cached_device_type: Optional[str] = None
+        self._attention_cached_device_index: Optional[int] = None
+        self._attention_cached_batch: Optional[int] = None
+        self._attention_cached_sequence: Optional[int] = None
+        self._attention_cached_d_model: Optional[int] = None
+        self._attention_cached_causal: Optional[bool] = None
+        self._attention_cached_autograd: Optional[bool] = None
+        self._attention_cached_bf16_threshold: Optional[int] = None
 
         # Keep the baseline's exact learned parameter names for strict=True
         # state-dict copying.
@@ -2156,6 +2204,85 @@ class TritonFusedSelfAttention(nn.Module):
         self.k_proj = nn.Linear(d_model, d_model, bias=True)
         self.v_proj = nn.Linear(d_model, d_model, bias=True)
         self.out_proj = nn.Linear(d_model, d_model, bias=True)
+
+    @staticmethod
+    def _dtype_name(dtype: torch.dtype) -> str:
+        return {
+            torch.float16: "float16",
+            torch.bfloat16: "bfloat16",
+            torch.float32: "float32",
+        }.get(dtype, str(dtype).removeprefix("torch."))
+
+    def _attention_plan(
+        self,
+        x: torch.Tensor,
+        causal: bool,
+        needs_autograd: bool,
+    ):
+        batch, sequence_length, _ = x.shape
+        device_index = x.device.index if x.device.type == "cuda" else None
+        if (
+            self._attention_cached_result is not None
+            and self._attention_cached_dtype == x.dtype
+            and self._attention_cached_device_type == x.device.type
+            and self._attention_cached_device_index == device_index
+            and self._attention_cached_batch == batch
+            and self._attention_cached_sequence == sequence_length
+            and self._attention_cached_d_model == x.shape[-1]
+            and self._attention_cached_causal == causal
+            and self._attention_cached_autograd == needs_autograd
+            and self._attention_cached_bf16_threshold == _BF16_FUSED_MIN_LENGTH
+        ):
+            return self._attention_cached_result
+        model_spec = self._attention_model_spec
+        if model_spec is None:
+            model_spec = AttentionModelSpec(
+                batch_size=batch,
+                sequence_length=sequence_length,
+                d_model=self.d_model,
+                num_heads=self.num_heads,
+                ffn_dim=self.d_model,
+                num_layers=1,
+                causal=causal,
+            )
+            scope = PlanScope.STANDALONE
+            layer_index = 0
+        else:
+            scope = PlanScope.MODEL
+            layer_index = self._attention_layer_index
+            if layer_index is None:
+                raise ValueError("model-scoped attention requires a layer index")
+        capability = None
+        if x.device.type == "cuda" and torch.cuda.is_available():
+            capability = torch.cuda.get_device_capability(x.device)
+        runtime = AttentionRuntime(
+            batch_size=batch,
+            sequence_length=sequence_length,
+            d_model=x.shape[-1],
+            dtype=self._dtype_name(x.dtype),
+            device_type=x.device.type,
+            device_capability=capability,
+            needs_autograd=needs_autograd,
+            causal=causal,
+            bf16_fused_min_length=_BF16_FUSED_MIN_LENGTH,
+        )
+        stack_plan = select_attention_stack_plan(model_spec, runtime, scope)
+        if layer_index < 0 or layer_index >= len(stack_plan.layers):
+            raise ValueError(
+                f"attention layer index {layer_index} is outside the selected plan"
+            )
+        result = (stack_plan, stack_plan.layers[layer_index])
+        self._attention_cached_result = result
+        self._attention_cached_dtype = x.dtype
+        self._attention_cached_device_type = x.device.type
+        self._attention_cached_device_index = device_index
+        self._attention_cached_batch = batch
+        self._attention_cached_sequence = sequence_length
+        self._attention_cached_d_model = x.shape[-1]
+        self._attention_cached_causal = causal
+        self._attention_cached_autograd = needs_autograd
+        self._attention_cached_bf16_threshold = _BF16_FUSED_MIN_LENGTH
+        return result
 
     def _split_heads(self, x: torch.Tensor) -> torch.Tensor:
         batch, sequence_length, _ = x.shape
@@ -2224,105 +2351,29 @@ class TritonFusedSelfAttention(nn.Module):
         causal: bool = False,
     ) -> torch.Tensor:
         batch, sequence_length, _ = x.shape
-
         needs_autograd = torch.is_grad_enabled() and (
             x.requires_grad
             or any(parameter.requires_grad for parameter in self.parameters())
         )
-        can_use_fused_full_attention = (
-            x.device.type == "cuda"
-            and x.dtype in _SUPPORTED_DTYPES
-            and sequence_length <= 128
-            and sequence_length in (32, 64, 128)
-            and (
-                self.head_dim in _SUPPORTED_HEAD_DIMS
-                or (
-                    x.dtype == torch.float32
-                    and sequence_length == 128
-                    and self.head_dim == 8
-                )
-            )
-            and (
-                x.dtype != torch.float32
-                or _supports_fp32_fused_shape(sequence_length, self.head_dim)
-            )
-            and not needs_autograd
-        )
-        can_use_fp32_tiled_attention = (
-            self._enable_fp32_tiled_attention
-            and x.device.type == "cuda"
-            and x.dtype == torch.float32
-            and causal
-            and sequence_length >= _FP32_TILED_MIN_LENGTH
-            and self.head_dim in (32, 64)
-            and not needs_autograd
-        )
-        can_use_fp32_d256_attention = (
-            self._enable_fp32_d256_attention
-            and x.device.type == "cuda"
-            and x.dtype == torch.float32
-            and causal
-            and sequence_length == 128
-            and self.head_dim == 256
-            and not needs_autograd
-        )
-        # The FP32 D=32 Gluon reduction is individually close to the native
-        # result but can cross the official gate after four residual blocks.
-        # UserOptimizedTransformer supplies a shape-specific exact-layer flag;
-        # standalone adapters remain fully fused unless explicitly configured.
-        use_exact_fp32_layer = (
-            self._force_exact_fp32
-            and x.dtype == torch.float32
-            and not needs_autograd
-        )
-        can_use_long_attention = (
-            x.device.type == "cuda"
-            and x.dtype == torch.float16
-            and causal
-            and sequence_length >= _LONG_SEQUENCE_MIN_LENGTH
-            and (
-                self.head_dim == 64
-                or (
-                    self.head_dim == 32
-                    and sequence_length == _D32_LONG_SEQUENCE_LENGTH
-                )
-            )
-            and not needs_autograd
-        )
-        can_use_long_bfloat16_attention = (
-            x.device.type == "cuda"
-            and x.dtype == torch.bfloat16
-            and causal
-            and sequence_length >= _LONG_SEQUENCE_MIN_LENGTH
-            and self.head_dim == 64
-            and not needs_autograd
-        )
-        use_exact_d32_first_block = (
-            self._long_sequence_layer_index == 0
-            and x.dtype == torch.float16
-            and causal
-            and sequence_length == _D32_LONG_SEQUENCE_LENGTH
-            and self.head_dim == 32
-            and not needs_autograd
-        )
-        # FP32 configurations outside a validated custom path must follow the
-        # organizer operation/layout sequence directly.  In particular, do
-        # not create adapter views and then discover a nested fallback.
-        if x.dtype == torch.float32 and (
-            use_exact_fp32_layer
-            or not (
-                can_use_fused_full_attention
-                or can_use_fp32_tiled_attention
-                or can_use_fp32_d256_attention
-            )
-        ):
+        _, plan = self._attention_plan(x, causal, needs_autograd)
+
+        # FP32 exact execution mirrors the organizer from the first projection
+        # onward, so it must happen before adapter Q/K/V views are created.
+        if plan.mode == AttentionMode.FP32_BASELINE_EXACT:
             return self._baseline_exact_forward(x, valid_token_mask, causal)
 
         q = self._split_heads(self.q_proj(x))
         k = self._split_heads(self.k_proj(x))
         v = self._split_heads(self.v_proj(x))
 
-        if can_use_fused_full_attention and not use_exact_fp32_layer:
+        if plan.mode in (
+            AttentionMode.FP16_FULL_ROW,
+            AttentionMode.BF16_FULL_ROW,
+            AttentionMode.FP32_FULL_ROW_TF32,
+            AttentionMode.FP32_SMALL_HEAD_TF32,
+        ):
+            if plan.launch is None:
+                raise RuntimeError("full-row plan is missing launch metadata")
             context = triton_fused_full_attention(
                 q,
                 k,
@@ -2331,9 +2382,15 @@ class TritonFusedSelfAttention(nn.Module):
                 causal=causal,
                 scale=self.scale,
                 output_bshd=True,
+                strict=True,
+                block_m=plan.launch.block_m,
+                block_n=plan.launch.block_n,
+                num_warps=plan.launch.num_warps,
             )
             context = context.view(batch, sequence_length, self.d_model)
-        elif can_use_fp32_tiled_attention:
+        elif plan.mode == AttentionMode.FP32_LONG_TILED:
+            if plan.launch is None:
+                raise RuntimeError("FP32 tiled plan is missing launch metadata")
             context = _triton_fp32_tiled_attention(
                 q,
                 k,
@@ -2342,54 +2399,45 @@ class TritonFusedSelfAttention(nn.Module):
                 causal,
                 self.scale,
                 output_bshd=True,
+                block_m=plan.launch.block_m,
+                block_n=plan.launch.block_n,
+                num_warps=plan.launch.num_warps,
+                num_stages=plan.launch.num_stages,
             )
             context = context.view(batch, sequence_length, self.d_model)
-        elif can_use_fp32_d256_attention:
-            context = _triton_fp32_d256_attention(
+        elif plan.mode == AttentionMode.FP16_BLOCKED_EXACT:
+            context = _blocked_fp16_attention(
+                q, k, v, valid_token_mask, causal, self.scale
+            )
+            context = context.view(batch, sequence_length, self.d_model)
+        elif plan.mode == AttentionMode.BF16_BLOCKED_EXACT:
+            context = _blocked_bfloat16_attention(
+                q, k, v, valid_token_mask, causal, self.scale
+            )
+            context = context.view(batch, sequence_length, self.d_model)
+        elif plan.mode in (
+            AttentionMode.FP16_TWO_PASS,
+            AttentionMode.FP16_LONG_TILED,
+            AttentionMode.BF16_LONG_TILED,
+        ):
+            if plan.launch is None:
+                raise RuntimeError("tiled plan is missing launch metadata")
+            context = triton_fused_attention(
                 q,
                 k,
                 v,
-                valid_token_mask,
-                causal,
-                self.scale,
+                valid_token_mask=valid_token_mask,
+                causal=causal,
+                scale=self.scale,
                 output_bshd=True,
+                strict=True,
+                block_m=plan.launch.block_m,
+                block_n=plan.launch.block_n,
+                num_warps=plan.launch.num_warps,
+                num_stages=plan.launch.num_stages,
             )
             context = context.view(batch, sequence_length, self.d_model)
-        elif can_use_long_attention:
-            if use_exact_d32_first_block:
-                context = _blocked_fp16_attention(
-                    q, k, v, valid_token_mask, causal, self.scale
-                )
-            else:
-                # The tiled kernel keeps Q/K/V in their transposed views and
-                # writes [B, S, H, D] directly, avoiding a large transpose.
-                context = triton_fused_attention(
-                    q,
-                    k,
-                    v,
-                    valid_token_mask=valid_token_mask,
-                    causal=causal,
-                    scale=self.scale,
-                    output_bshd=True,
-                )
-            context = context.view(batch, sequence_length, self.d_model)
-        elif can_use_long_bfloat16_attention:
-            if sequence_length >= _BF16_FUSED_MIN_LENGTH:
-                context = triton_fused_attention(
-                    q,
-                    k,
-                    v,
-                    valid_token_mask=valid_token_mask,
-                    causal=causal,
-                    scale=self.scale,
-                    output_bshd=True,
-                )
-            else:
-                context = _blocked_bfloat16_attention(
-                    q, k, v, valid_token_mask, causal, self.scale
-                )
-            context = context.view(batch, sequence_length, self.d_model)
-        else:
+        elif plan.mode == AttentionMode.EXACT_REFERENCE:
             context = _reference_attention(
                 q,
                 k,
@@ -2403,6 +2451,8 @@ class TritonFusedSelfAttention(nn.Module):
                 .contiguous()
                 .view(batch, sequence_length, self.d_model)
             )
+        else:
+            raise RuntimeError(f"no executor registered for attention mode {plan.mode}")
         output = self.out_proj(context)
 
         # Match BaselineSelfAttention: padding masks keys inside attention, then

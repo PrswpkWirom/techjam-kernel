@@ -63,7 +63,7 @@ submitted commit and repeat it for every organizer-announced shape.
 
 ## Case 13 FP16 D_head=32 long-sequence path
 
-Date: 2026-08-30
+Date: 2026-08-31
 
 Environment: NVIDIA GeForce RTX 5070 Ti (sm120), PyTorch 2.13.0+cu130,
 Triton 3.7.1, FP16, causal `B=64,S=1024,D=128,H=4,L=4,FFN=128`.
@@ -619,3 +619,57 @@ also passed.
 | 12 | 64,32,128,4 | EFFF | Gluon full-row D32 | PASS | 1.0363 ms | 0.9749 ms | 1.063x | — |
 | 13 | 64,1024,128,4 | FFFF | tiled FP32 TF32 MMA | PASS | 99.3595 ms | 8.3001 ms | 11.971x | — |
 | 14 | 32,100000,1024,16 | FF (B=1 validated) | tiled FP32 TF32 MMA | bounded-oracle PASS | N/A | N/A (B=32) | N/A | requires >=32 GiB; dense baseline infeasible |
+
+## Central attention planning refactor
+
+Date: 2026-08-30
+
+The production adapter now obtains an immutable `AttentionStackPlan` from
+`model/attention_dispatch.py`.  The torch-free planner is the single source of
+truth for dtype, shape, per-layer numerical policy, launch metadata, and the
+case-14 whole-stack microbatch decision.  `TritonFusedSelfAttention` executes
+the selected mode through strict kernel entry points; optimized entry points
+raise on an invalid plan instead of silently falling back to dense attention.
+
+The initial parity matrix preserves the published FP32 EFFF/EEFF/FFFF/EEEE
+policies, FP32 D_head=8 and tiled-TF32 paths, FP16 case-13 blocked-first /
+two-pass execution, BF16 long D_head=64 behavior, and explicit exact reasons
+for BF16 case 13 and rejected D_head=256/D_head=128 candidates.  The new
+`tools/inspect_attention_dispatch.py` command exposes the same plans without
+running a model, for example:
+
+```bash
+.venv/bin/python tools/inspect_attention_dispatch.py \
+  --case 13 --dtype float16 --compute-capability 12.0
+```
+
+Planner characterization covers all 14 published cases across all three
+dtypes; CLI tests exercise representative case 11, case 13, and case 14
+text/JSON output.  The existing CUDA attention suite remains green after the
+refactor.  Official post-refactor matrix commands and raw outputs are kept in
+the ignored `results/post-refactor-*` directories; no accuracy tolerance or
+protected evaluator code was changed.
+
+The first sequential coverage experiment (BF16 case 13, D_head=32) was kept
+outside production dispatch.  The existing two-pass stats/output kernels passed
+an isolated padded causal attention check (0 failed elements), but the
+four-layer residual check failed (39,526 elements).  An offline sweep of all
+16 exact/candidate layer masks found only the all-exact mask passing; therefore
+the planner retains `bf16_d32_long_unvalidated` for this case and no timing
+claim is made for the prototype.  FP16/BF16 D_head=8 and D_head=256 remain
+explicitly unenabled pending the same certification gates; the planner’s
+`d256_specialized` family is reserved for a future certified mode and is not
+selected today.
+
+Validation evidence for this refactor was collected on the RTX 5070 Ti
+(sm120, PyTorch 2.13.0+cu130, Triton 3.7.1).  With the pinned evaluator
+arguments, FP16 and BF16 cases 1–13 all passed in the final-hash matrices;
+FP32 cases 1–6 passed in the pre-cache parity run and cases 7–13 passed in the
+final-hash regenerated tail matrix after the planner fix.  Representative
+post-refactor medians include FP16 case 13 at 14.324 ms (4.871x) and FP32
+case 13 at 8.692 ms (11.954x); BF16 case 13 remains the explicit exact
+fallback at 85.589 ms
+(0.996x).  A padded B=1 long-sequence
+smoke passed for all dtypes with finite, zeroed padded queries: FP16 799.389 ms
+(1,820 MiB peak), BF16 958.671 ms (1,820 MiB), and FP32 1,339.884 ms
+(3,596 MiB).  The 57-test suite, bytecode checks, and integrity checker passed.

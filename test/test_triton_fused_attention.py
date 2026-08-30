@@ -649,9 +649,6 @@ class TritonFusedAttentionTests(unittest.TestCase):
         baseline = BaselineTransformer(config).cuda().float().eval()
         candidate = UserOptimizedTransformer(config).cuda().float().eval()
         copy_model_weights(baseline, candidate)
-        for layer in candidate.layers:
-            layer.attention._force_exact_fp32 = False
-            layer.attention._enable_fp32_tiled_attention = True
         x = torch.randn((1, 1024, 1024), device="cuda", dtype=torch.float32)
         mask = torch.arange(1024, device="cuda")[None, :] < 783
         with torch.inference_mode():
@@ -1190,6 +1187,13 @@ class TritonFusedAttentionTests(unittest.TestCase):
         _assert_official_tolerance(actual, expected)
         actual.square().mean().backward()
         self.assertIsNotNone(x.grad)
+
+    def test_strict_optimized_entry_points_never_hide_unsupported_fallbacks(self) -> None:
+        q = torch.randn((1, 2, 32, 16), dtype=torch.float16)
+        with self.assertRaises(ValueError):
+            triton_fused_full_attention(q, q, q, causal=True, strict=True)
+        with self.assertRaises(ValueError):
+            triton_fused_attention(q, q, q, causal=True, strict=True)
 
     def test_fused_adapter_passes_six_layer_official_tolerance(self) -> None:
         from torch_transformer_benchmark import (
