@@ -526,6 +526,13 @@ projection order, contiguous split-head layout, masking, FP32 softmax, P@V,
 and output projection.  It fixes the previous nested-fallback regression and
 remains the deliberate path for cases 8 and 9.
 
+A representative otherwise-unsupported FP32 configuration
+`B=64,S=128,D=48,H=4,FFN=48,L=4,causal` was also timed through the unchanged
+official harness: 20 unpadded accuracy seeds were bit-exact and the median was
+`1.0039 ms` baseline versus `1.0156 ms` optimized (`0.988x`). Its 20-seed
+25%-padding check was likewise bit-exact. This is the intended approximately
+1.0x no-regression result for shapes that have no retained custom kernel.
+
 The selected FP32 specializations are deliberately separate:
 
 - Case 12 extends the full-row Gluon whitelist to `(S=32,D_head=32)`. `FFFF`

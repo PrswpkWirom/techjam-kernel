@@ -563,6 +563,24 @@ class TritonFusedAttentionTests(unittest.TestCase):
         self.assertEqual(exact.call_count, 4)
         self.assertTrue(torch.equal(actual, expected))
 
+    def test_blocked_fp32_oracle_matches_dense_attention(self) -> None:
+        """Establish the bounded long-sequence oracle against dense FP32 attention."""
+        from model.triton_fused_attention import _blocked_fp32_attention
+
+        torch.manual_seed(14639)
+        q = torch.randn((2, 2, 128, 64), device="cuda", dtype=torch.float32)
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+        mask = torch.arange(128, device="cuda")[None, :] < torch.tensor(
+            [128, 83], device="cuda"
+        )[:, None]
+        with torch.inference_mode():
+            expected = _reference_attention(q, k, v, mask, causal=True)
+            actual = _blocked_fp32_attention(
+                q, k, v, mask, causal=True, scale=64 ** -0.5
+            )
+        _assert_official_tolerance(actual.transpose(1, 2), expected)
+
     def test_fp32_tiled_d64_matches_bounded_reference_with_padding(self) -> None:
         """The generalized long FP32 kernel matches the bounded oracle."""
         from model.triton_fused_attention import (
