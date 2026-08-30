@@ -188,6 +188,7 @@ class TritonFusedAttentionTests(unittest.TestCase):
         )
         torch.manual_seed(1234)
         torch.cuda.manual_seed_all(1234)
+        torch.cuda.empty_cache()
         baseline = BaselineTransformer(config).cuda().float().eval()
         candidate = UserOptimizedTransformer(config).cuda().float().eval()
         copy_model_weights(baseline, candidate)
@@ -231,6 +232,67 @@ class TritonFusedAttentionTests(unittest.TestCase):
                 direct = triton_fused_full_attention(q, k, v, causal=True)
         self.assertEqual(tuple(direct.shape), tuple(q.shape))
         self.assertTrue(bool(torch.isfinite(direct).all()))
+
+    def test_fp32_d32_case6_uses_two_exact_layers_and_passes_gate(self) -> None:
+        """The large published D=32 case uses the validated EEFF policy."""
+        from torch_transformer_benchmark import (
+            BaselineTransformer,
+            TransformerConfig,
+            UserOptimizedTransformer,
+            copy_model_weights,
+            generate_random_case,
+        )
+
+        config = TransformerConfig(
+            batch_size=10000,
+            seq_len=128,
+            d_model=128,
+            num_heads=4,
+            ffn_dim=128,
+            num_layers=4,
+            causal=True,
+        )
+        torch.manual_seed(1234)
+        torch.cuda.manual_seed_all(1234)
+        torch.cuda.empty_cache()
+        baseline = BaselineTransformer(config).cuda().float().eval()
+        candidate = UserOptimizedTransformer(config).cuda().float().eval()
+        copy_model_weights(baseline, candidate)
+        x, valid_token_mask = generate_random_case(
+            config=config,
+            device=torch.device("cuda"),
+            dtype=torch.float32,
+            seed=1244,
+            padding_ratio=0.0,
+            input_scale=1.0,
+        )
+        with torch.inference_mode():
+            expected = baseline(x, valid_token_mask).cpu()
+        del baseline
+        torch.cuda.empty_cache()
+
+        from model.triton_fused_attention import (
+            _reference_attention as reference_attention,
+        )
+
+        with mock.patch(
+            "model.triton_fused_attention.triton_fused_full_attention",
+            wraps=triton_fused_full_attention,
+        ) as fused, mock.patch(
+            "model.triton_fused_attention._reference_attention",
+            wraps=reference_attention,
+        ) as exact:
+            with torch.inference_mode():
+                actual = candidate(x, valid_token_mask)
+
+        self.assertEqual(fused.call_count, 2)
+        self.assertEqual(exact.call_count, 2)
+        actual_cpu = actual.cpu()
+        self.assertEqual(tuple(actual_cpu.shape), tuple(expected.shape))
+        self.assertTrue(bool(torch.isfinite(actual_cpu).all()))
+        _assert_official_tolerance(actual_cpu, expected)
+        del actual, actual_cpu, expected, candidate, x, valid_token_mask
+        torch.cuda.empty_cache()
 
     def test_full_attention_fallback_matches_contiguous_reference_all_dtypes(self) -> None:
         """Unsupported sequence lengths retain the baseline operation order."""

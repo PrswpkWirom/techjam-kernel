@@ -1595,6 +1595,9 @@ class TritonFusedSelfAttention(nn.Module):
         self.scale = self.head_dim**-0.5
         # UserOptimizedTransformer fills this for long-stack numerical policy.
         self._long_sequence_layer_index: Optional[int] = None
+        # Model-level short FP32 D=32 dispatch can force the exact operation
+        # order for selected residual blocks without changing public APIs.
+        self._force_exact_fp32_d32 = False
 
         # Keep the baseline's exact learned parameter names for strict=True
         # state-dict copying.
@@ -1640,10 +1643,10 @@ class TritonFusedSelfAttention(nn.Module):
         )
         # The FP32 D=32 Gluon reduction is individually close to the native
         # result but can cross the official gate after four residual blocks.
-        # Keep the first block exact while allowing later blocks to benefit
-        # from the fused path.  Other dtypes/shapes retain their prior policy.
-        use_exact_fp32_d32_first_block = (
-            self._long_sequence_layer_index == 0
+        # UserOptimizedTransformer supplies a shape-specific exact-layer flag;
+        # standalone adapters remain fully fused unless explicitly configured.
+        use_exact_fp32_d32_layer = (
+            self._force_exact_fp32_d32
             and x.dtype == torch.float32
             and sequence_length == 128
             and self.head_dim == 32
@@ -1679,7 +1682,7 @@ class TritonFusedSelfAttention(nn.Module):
             and self.head_dim == 32
             and not needs_autograd
         )
-        if can_use_fused_full_attention and not use_exact_fp32_d32_first_block:
+        if can_use_fused_full_attention and not use_exact_fp32_d32_layer:
             context = triton_fused_full_attention(
                 q,
                 k,
