@@ -274,6 +274,17 @@ class TritonFusedAttentionTests(unittest.TestCase):
         from model.triton_fused_attention import (
             _reference_attention as reference_attention,
         )
+        from model.triton_gluon_attention import (
+            triton_gluon_full_attention as gluon_full_attention,
+        )
+
+        def guarded_gluon(*args: object, **kwargs: object) -> torch.Tensor:
+            """Fail if a supposedly fused call falls back to torch.matmul."""
+            with mock.patch(
+                "model.triton_gluon_attention.torch.matmul",
+                side_effect=AssertionError("unexpected case-6 Gluon fallback"),
+            ):
+                return gluon_full_attention(*args, **kwargs)
 
         with mock.patch(
             "model.triton_fused_attention.triton_fused_full_attention",
@@ -281,12 +292,16 @@ class TritonFusedAttentionTests(unittest.TestCase):
         ) as fused, mock.patch(
             "model.triton_fused_attention._reference_attention",
             wraps=reference_attention,
-        ) as exact:
+        ) as exact, mock.patch(
+            "model.triton_fused_attention.triton_gluon_full_attention",
+            side_effect=guarded_gluon,
+        ) as gluon:
             with torch.inference_mode():
                 actual = candidate(x, valid_token_mask)
 
         self.assertEqual(fused.call_count, 2)
         self.assertEqual(exact.call_count, 2)
+        self.assertEqual(gluon.call_count, 2)
         actual_cpu = actual.cpu()
         self.assertEqual(tuple(actual_cpu.shape), tuple(expected.shape))
         self.assertTrue(bool(torch.isfinite(actual_cpu).all()))
