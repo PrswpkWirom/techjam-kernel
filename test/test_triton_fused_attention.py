@@ -167,6 +167,71 @@ class TritonFusedAttentionTests(unittest.TestCase):
                 self.assertEqual(output.shape, x.shape)
                 self.assertEqual(output.dtype, dtype)
 
+    def test_fp32_d32_case1_uses_hybrid_dispatch_and_passes_gate(self) -> None:
+        """D=32 keeps the first stack block exact and fuses the remaining blocks."""
+        from torch_transformer_benchmark import (
+            BaselineTransformer,
+            TransformerConfig,
+            UserOptimizedTransformer,
+            copy_model_weights,
+            generate_random_case,
+        )
+
+        config = TransformerConfig(
+            batch_size=64,
+            seq_len=128,
+            d_model=128,
+            num_heads=4,
+            ffn_dim=128,
+            num_layers=4,
+            causal=True,
+        )
+        torch.manual_seed(1234)
+        torch.cuda.manual_seed_all(1234)
+        baseline = BaselineTransformer(config).cuda().float().eval()
+        candidate = UserOptimizedTransformer(config).cuda().float().eval()
+        copy_model_weights(baseline, candidate)
+        x, valid_token_mask = generate_random_case(
+            config=config,
+            device=torch.device("cuda"),
+            dtype=torch.float32,
+            seed=1253,
+            padding_ratio=0.0,
+            input_scale=1.0,
+        )
+        with torch.inference_mode():
+            expected = baseline(x, valid_token_mask)
+
+        from model.triton_fused_attention import (
+            _reference_attention as reference_attention,
+        )
+        with mock.patch(
+            "model.triton_fused_attention.triton_fused_full_attention",
+            wraps=triton_fused_full_attention,
+        ) as fused, mock.patch(
+            "model.triton_fused_attention._reference_attention",
+            wraps=reference_attention,
+        ) as exact:
+            with torch.inference_mode():
+                actual = candidate(x, valid_token_mask)
+
+        self.assertEqual(fused.call_count, 3)
+        self.assertEqual(exact.call_count, 1)
+        _assert_official_tolerance(actual, expected)
+        self.assertTrue(bool(torch.isfinite(actual).all()))
+
+        q = torch.randn((1, 2, 128, 32), device="cuda", dtype=torch.float32)
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+        with mock.patch(
+            "model.triton_gluon_attention.torch.matmul",
+            side_effect=AssertionError("unexpected D=32 Gluon fallback"),
+        ):
+            with torch.inference_mode():
+                direct = triton_fused_full_attention(q, k, v, causal=True)
+        self.assertEqual(tuple(direct.shape), tuple(q.shape))
+        self.assertTrue(bool(torch.isfinite(direct).all()))
+
     def test_full_attention_fallback_matches_contiguous_reference_all_dtypes(self) -> None:
         """Unsupported sequence lengths retain the baseline operation order."""
         for dtype in (torch.float16, torch.bfloat16, torch.float32):

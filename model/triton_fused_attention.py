@@ -17,7 +17,7 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 from .triton_gluon_attention import (
-    _FP32_FUSED_HEAD_DIMS,
+    _supports_fp32_fused_shape,
     triton_gluon_full_attention,
 )
 
@@ -1467,11 +1467,14 @@ def triton_fused_full_attention(
         or sequence_length > 128
         or sequence_length not in (32, 64, 128)
         or head_dim not in _SUPPORTED_HEAD_DIMS
-        # Plain TF32 is within the gate for the common D_head=64 path.  The
-        # other FP32 head sizes can differ by just over the strict absolute
-        # threshold after several residual layers, so they stay on the exact
-        # fallback until a stronger reduction-matching MMA path is available.
-        or (q.dtype == torch.float32 and head_dim not in _FP32_FUSED_HEAD_DIMS)
+        # Plain TF32 is within the validated gate for the existing D_head=64
+        # shapes and the first D_head=32 milestone shape. Other FP32 shapes
+        # stay on the exact fallback until a stronger reduction-matching MMA
+        # path is available.
+        or (
+            q.dtype == torch.float32
+            and not _supports_fp32_fused_shape(sequence_length, head_dim)
+        )
         or block_n not in (32, 64, 128)
         or torch.cuda.get_device_capability(q.device)[0] < 12
         or (torch.is_grad_enabled() and (q.requires_grad or k.requires_grad or v.requires_grad))
@@ -1631,8 +1634,19 @@ class TritonFusedSelfAttention(nn.Module):
             and self.head_dim in _SUPPORTED_HEAD_DIMS
             and (
                 x.dtype != torch.float32
-                or self.head_dim in _FP32_FUSED_HEAD_DIMS
+                or _supports_fp32_fused_shape(sequence_length, self.head_dim)
             )
+            and not needs_autograd
+        )
+        # The FP32 D=32 Gluon reduction is individually close to the native
+        # result but can cross the official gate after four residual blocks.
+        # Keep the first block exact while allowing later blocks to benefit
+        # from the fused path.  Other dtypes/shapes retain their prior policy.
+        use_exact_fp32_d32_first_block = (
+            self._long_sequence_layer_index == 0
+            and x.dtype == torch.float32
+            and sequence_length == 128
+            and self.head_dim == 32
             and not needs_autograd
         )
         can_use_long_attention = (
@@ -1665,7 +1679,7 @@ class TritonFusedSelfAttention(nn.Module):
             and self.head_dim == 32
             and not needs_autograd
         )
-        if can_use_fused_full_attention:
+        if can_use_fused_full_attention and not use_exact_fp32_d32_first_block:
             context = triton_fused_full_attention(
                 q,
                 k,

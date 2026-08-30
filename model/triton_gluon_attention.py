@@ -16,7 +16,17 @@ from triton.language.extra import libdevice
 _SUPPORTED_HEAD_DIMS = (16, 32, 64, 128)
 _SUPPORTED_SEQUENCE_LENGTHS = (32, 64, 128)
 _SUPPORTED_WARPS = (1, 2, 4, 8)
-_FP32_FUSED_HEAD_DIMS = (64,)
+# FP32 D=32 is admitted only for the first milestone shape.  The Gluon MMA
+# reduction is not bit-equivalent to the baseline for every short shape, so
+# keep the shape boundary explicit instead of widening by head dimension.
+_FP32_FUSED_SHAPES = ((128, 32), (32, 64), (64, 64), (128, 64))
+
+
+def _supports_fp32_fused_shape(sequence_length: int, head_dim: int) -> bool:
+    """Return whether the validated FP32 Gluon shape envelope includes input."""
+
+    return (sequence_length, head_dim) in _FP32_FUSED_SHAPES
+
 
 # These values are deliberately compile-time kernel modes.  Keeping the mode
 # out of the element-wise dataflow lets Gluon emit one specialization per
@@ -233,7 +243,10 @@ def triton_gluon_full_attention(
     supported = (
         q.device.type == "cuda"
         and q.dtype in (torch.float16, torch.bfloat16, torch.float32)
-        and (q.dtype != torch.float32 or head_dim in _FP32_FUSED_HEAD_DIMS)
+        and (
+            q.dtype != torch.float32
+            or _supports_fp32_fused_shape(sequence_length, head_dim)
+        )
         and head_dim in _SUPPORTED_HEAD_DIMS
         and sequence_length in _SUPPORTED_SEQUENCE_LENGTHS
         and block_m in (16, 32, 64, 128)

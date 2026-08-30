@@ -400,3 +400,59 @@ and FP32. Core cases 1/9/12 passed 20-trial checks for FP16/BF16; FP32 case 10
 (D_head=64) passed 20 trials with its performance run. Case 14 remains
 preflight-blocked because the protected dense baseline would require tens of
 terabytes for its `[B,H,S,S]` tensor.
+
+## FP32 D=32 short-sequence hybrid coverage
+
+Date: 2026-08-30
+
+The first FP32 D=32 milestone enables the Gluon full-row kernel only for
+`S=128, head_dim=32` (the existing FP32 D=64 shapes remain unchanged). The
+four-layer model keeps layer 0 on the exact contiguous PyTorch-compatible
+attention path and uses Gluon for layers 1–3. This is the smallest change that
+preserves correctness while retaining most of the fusion; all tested Gluon
+launch configurations produced the same numerical result, so changing
+`BLOCK_M` or warp count did not repair the fully fused stack.
+
+The mismatch was localized with a deterministic case-1 probe (`seed=1253`):
+
+| stage/probe | result |
+|---|---:|
+| fully fused four-layer stack | 1 failed element, `max_abs=0.00210861` |
+| exact one-product QK, scale + softmax | `max_abs=7.6e-6` |
+| real D=32 QK probability probe | `max_abs=4.88e-4` |
+| uniform-probability P@V probe | `max_abs=8.51e-5` |
+| varied-probability P@V contribution | up to `9.77e-4` |
+
+The dominant error begins in the TF32 QK MMA accumulation/reduction order;
+P@V MMA reduction adds a smaller independent error. Neither error usually
+breaks a single attention call, but residual accumulation across four blocks
+can cross the official gate in the final block. The scale and FP32 softmax
+are not the primary source.
+
+Validation on the NVIDIA GeForce RTX 5070 Ti (`torch 2.13.0+cu130`, CUDA
+13.0, Triton 3.7.1) used the protected evaluator with `atol=0.002`,
+`rtol=0.02`, TF32 enabled, `matmul-precision=high`, 100 accuracy trials,
+20 warmups, 100 repeats, and 10 alternating benchmark rounds. The hybrid
+path selected one exact call and three Gluon calls per forward, passed all
+`104,857,600` checked elements with zero failures, and produced:
+
+| run | baseline median | optimized median | speedup |
+|---|---:|---:|---:|
+| pre-change exact fallback | 1.4339 ms | 1.4371 ms | 0.998x |
+| first | 1.4377 ms | 0.9614 ms | 1.495x |
+| repeat | 1.4302 ms | 0.9516 ms | 1.503x |
+
+The exact command was:
+
+```bash
+.venv/bin/python torch_transformer_benchmark.py \
+  --batch-size 64 --seq-len 128 --d-model 128 --heads 4 \
+  --ffn-dim 128 --layers 4 --causal --device cuda --dtype float32 \
+  --padding-ratio 0.0 --input-scale 1.0 --accuracy-trials 100 \
+  --rtol 0.02 --atol 0.002 --seed 1234 --warmup 20 --repeats 100 \
+  --benchmark-rounds 10 --matmul-precision high --allow-tf32
+```
+
+Next, sweep this policy across cases 2–6 and add the `S=32` D=32
+specialization for case 12. Only after those correctness gates pass should
+the short FP32 D=128, D=8, and D=256 kernels be investigated.
