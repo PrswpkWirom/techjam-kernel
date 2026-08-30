@@ -8,7 +8,7 @@ execution use the value-equivalent PyTorch fallback.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -29,6 +29,7 @@ _LONG_SEQUENCE_MIN_LENGTH = 257
 _D32_LONG_SEQUENCE_LENGTH = 1024
 _BF16_FUSED_MIN_LENGTH = 100_000
 _BF16_QUERY_BLOCK_SIZE = 16
+_FP32_TILED_MIN_LENGTH = 1024
 
 
 @triton.jit
@@ -222,6 +223,233 @@ def _fused_attention_forward_kernel(
         output,
         mask=query_in_bounds[:, None],
     )
+
+
+@triton.jit
+def _fp32_tiled_attention_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    valid_token_mask_ptr,
+    output_ptr,
+    stride_q_batch,
+    stride_q_head,
+    stride_q_sequence,
+    stride_k_batch,
+    stride_k_head,
+    stride_k_sequence,
+    stride_v_batch,
+    stride_v_head,
+    stride_v_sequence,
+    stride_output_batch,
+    stride_output_head,
+    stride_output_sequence,
+    stride_mask_batch,
+    stride_mask_sequence,
+    num_heads: tl.constexpr,
+    sequence_length: tl.constexpr,
+    scale: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+    CAUSAL: tl.constexpr,
+    HAS_VALID_TOKEN_MASK: tl.constexpr,
+) -> None:
+    """FP32/TF32 causal FlashAttention recurrence with bounded state.
+
+    Scores, online-softmax state, and output remain FP32.  Both matrix
+    products use Blackwell TF32 MMA explicitly, and no score/probability tile
+    is written to global memory.
+    """
+    query_tile = tl.program_id(0)
+    batch_head = tl.program_id(1)
+    batch = batch_head // num_heads
+    head = batch_head % num_heads
+    query_offsets = query_tile * BLOCK_M + tl.arange(0, BLOCK_M)
+    key_lane_offsets = tl.arange(0, BLOCK_N)
+    dimension_offsets = tl.arange(0, HEAD_DIM)
+    query_in_bounds = query_offsets < sequence_length
+    q_offsets = (
+        batch * stride_q_batch
+        + head * stride_q_head
+        + query_offsets[:, None] * stride_q_sequence
+        + dimension_offsets[None, :]
+    )
+    q = tl.load(q_ptr + q_offsets, mask=query_in_bounds[:, None], other=0.0)
+    running_max = tl.full((BLOCK_M,), -float("inf"), tl.float32)
+    running_sum = tl.zeros((BLOCK_M,), tl.float32)
+    accumulator = tl.zeros((BLOCK_M, HEAD_DIM), tl.float32)
+    key_loop_end = sequence_length
+    if CAUSAL:
+        key_loop_end = tl.minimum((query_tile + 1) * BLOCK_M, sequence_length)
+
+    for key_start in tl.range(0, key_loop_end, BLOCK_N, num_stages=NUM_STAGES):
+        key_offsets = key_start + key_lane_offsets
+        key_in_bounds = key_offsets < sequence_length
+        k_offsets = (
+            batch * stride_k_batch
+            + head * stride_k_head
+            + key_offsets[:, None] * stride_k_sequence
+            + dimension_offsets[None, :]
+        )
+        v_offsets = (
+            batch * stride_v_batch
+            + head * stride_v_head
+            + key_offsets[:, None] * stride_v_sequence
+            + dimension_offsets[None, :]
+        )
+        k = tl.load(k_ptr + k_offsets, mask=key_in_bounds[:, None], other=0.0)
+        values = tl.load(v_ptr + v_offsets, mask=key_in_bounds[:, None], other=0.0)
+        scores = tl.dot(q, tl.trans(k), input_precision="tf32") * scale
+        included = query_in_bounds[:, None] & key_in_bounds[None, :]
+        if CAUSAL:
+            included &= key_offsets[None, :] <= query_offsets[:, None]
+        if HAS_VALID_TOKEN_MASK:
+            key_is_valid = tl.load(
+                valid_token_mask_ptr
+                + batch * stride_mask_batch
+                + key_offsets * stride_mask_sequence,
+                mask=key_in_bounds,
+                other=0,
+            ).to(tl.int1)
+            included &= key_is_valid[None, :]
+        scores = tl.where(included, scores, -float("inf"))
+        tile_max = tl.max(scores, axis=1)
+        new_max = tl.maximum(running_max, tile_max)
+        origin = tl.where(new_max == -float("inf"), 0.0, new_max)
+        alpha = tl.where(
+            running_max == -float("inf"),
+            0.0,
+            libdevice.exp(running_max - origin),
+        )
+        probabilities = tl.where(
+            included,
+            libdevice.exp(scores - origin[:, None]),
+            0.0,
+        )
+        accumulator = accumulator * alpha[:, None]
+        accumulator = tl.dot(
+            probabilities,
+            values,
+            accumulator,
+            input_precision="tf32",
+        )
+        running_sum = running_sum * alpha + tl.sum(probabilities, axis=1)
+        running_max = new_max
+
+    denominator = tl.where(running_sum > 0.0, running_sum, 1.0)
+    output = accumulator / denominator[:, None]
+    output_offsets = (
+        batch * stride_output_batch
+        + head * stride_output_head
+        + query_offsets[:, None] * stride_output_sequence
+        + dimension_offsets[None, :]
+    )
+    tl.store(output_ptr + output_offsets, output, mask=query_in_bounds[:, None])
+
+
+@triton.jit
+def _fp32_d256_attention_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    valid_token_mask_ptr,
+    output_ptr,
+    stride_q_batch,
+    stride_q_head,
+    stride_q_sequence,
+    stride_k_batch,
+    stride_k_head,
+    stride_k_sequence,
+    stride_v_batch,
+    stride_v_head,
+    stride_v_sequence,
+    stride_output_batch,
+    stride_output_head,
+    stride_output_sequence,
+    stride_mask_batch,
+    stride_mask_sequence,
+    num_heads: tl.constexpr,
+    sequence_length: tl.constexpr,
+    scale: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    CAUSAL: tl.constexpr,
+    HAS_VALID_TOKEN_MASK: tl.constexpr,
+) -> None:
+    """FP32 D=256 attention using 64-wide QK/PV chunks.
+
+    Each program owns a query tile and one 64-wide output slice.  It rebuilds
+    the FP32 score tile from four TF32 QK products, normalizes once across all
+    128 keys, then executes exactly one 64-wide TF32 PV product.
+    """
+    query_tile = tl.program_id(0)
+    batch_head = tl.program_id(1)
+    output_chunk = tl.program_id(2)
+    batch = batch_head // num_heads
+    head = batch_head % num_heads
+    query_offsets = query_tile * BLOCK_M + tl.arange(0, BLOCK_M)
+    key_offsets = tl.arange(0, 128)
+    chunk_offsets = tl.arange(0, 64)
+    query_in_bounds = query_offsets < sequence_length
+    key_in_bounds = key_offsets < sequence_length
+    scores = tl.zeros((BLOCK_M, 128), tl.float32)
+    for d_start in range(0, 256, 64):
+        dimension_offsets = d_start + chunk_offsets
+        q_offsets = (
+            batch * stride_q_batch
+            + head * stride_q_head
+            + query_offsets[:, None] * stride_q_sequence
+            + dimension_offsets[None, :]
+        )
+        k_offsets = (
+            batch * stride_k_batch
+            + head * stride_k_head
+            + key_offsets[:, None] * stride_k_sequence
+            + dimension_offsets[None, :]
+        )
+        q = tl.load(q_ptr + q_offsets, mask=query_in_bounds[:, None], other=0.0)
+        k = tl.load(k_ptr + k_offsets, mask=key_in_bounds[:, None], other=0.0)
+        scores += tl.dot(q, tl.trans(k), input_precision="tf32")
+    scores *= scale
+    included = query_in_bounds[:, None] & key_in_bounds[None, :]
+    if CAUSAL:
+        included &= key_offsets[None, :] <= query_offsets[:, None]
+    if HAS_VALID_TOKEN_MASK:
+        key_is_valid = tl.load(
+            valid_token_mask_ptr
+            + batch * stride_mask_batch
+            + key_offsets * stride_mask_sequence,
+            mask=key_in_bounds,
+            other=0,
+        ).to(tl.int1)
+        included &= key_is_valid[None, :]
+    scores = tl.where(included, scores, -float("inf"))
+    row_max = tl.max(scores, axis=1)
+    origin = tl.where(row_max == -float("inf"), 0.0, row_max)
+    numerator = tl.where(
+        included,
+        libdevice.exp(scores - origin[:, None]),
+        0.0,
+    )
+    denominator = tl.sum(numerator, axis=1)
+    probabilities = numerator / tl.where(denominator > 0.0, denominator, 1.0)[:, None]
+    output_dimensions = output_chunk * 64 + chunk_offsets
+    v_offsets = (
+        batch * stride_v_batch
+        + head * stride_v_head
+        + key_offsets[:, None] * stride_v_sequence
+        + output_dimensions[None, :]
+    )
+    values = tl.load(v_ptr + v_offsets, mask=key_in_bounds[:, None], other=0.0)
+    output = tl.dot(probabilities, values, input_precision="tf32")
+    output_offsets = (
+        batch * stride_output_batch
+        + head * stride_output_head
+        + query_offsets[:, None] * stride_output_sequence
+        + output_dimensions[None, :]
+    )
+    tl.store(output_ptr + output_offsets, output, mask=query_in_bounds[:, None])
 
 
 @triton.jit
@@ -1166,6 +1394,109 @@ def _blocked_fp16_attention(
     return output.transpose(1, 2).contiguous()
 
 
+def _blocked_fp32_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    valid_token_mask: Optional[torch.Tensor],
+    causal: bool,
+    scale: float,
+    query_block_size: int = 8,
+) -> torch.Tensor:
+    """Exact FP32 attention with bounded query-block score storage.
+
+    This is the long-sequence oracle: it preserves the baseline's native
+    operation order for each query block, while its only S-dependent temporary
+    has shape ``[B,H,query_block_size,S]`` instead of ``[B,H,S,S]``.
+    """
+    _, _, sequence_length, _ = _validate_inputs(q, k, v, valid_token_mask)
+    if q.dtype != torch.float32:
+        raise TypeError("bounded FP32 attention requires torch.float32 q/k/v")
+    if query_block_size <= 0:
+        raise ValueError("query_block_size must be positive")
+    if scale <= 0.0:
+        raise ValueError("scale must be positive")
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
+    output = torch.empty_like(q)
+    key_positions = torch.arange(sequence_length, device=q.device)
+    for query_start in range(0, sequence_length, query_block_size):
+        query_end = min(query_start + query_block_size, sequence_length)
+        scores = torch.matmul(
+            q[:, :, query_start:query_end], k.transpose(-2, -1)
+        ) * scale
+        if causal:
+            query_positions = torch.arange(
+                query_start, query_end, device=q.device
+            )
+            scores.masked_fill_(
+                key_positions[None, None, None, :]
+                > query_positions[None, None, :, None],
+                float("-inf"),
+            )
+        if valid_token_mask is not None:
+            scores.masked_fill_(
+                ~valid_token_mask[:, None, None, :], float("-inf")
+            )
+        probabilities = torch.softmax(scores.float(), dim=-1).to(q.dtype)
+        output[:, :, query_start:query_end].copy_(
+            torch.matmul(probabilities, v)
+        )
+    return output.transpose(1, 2).contiguous()
+
+
+def _blocked_fp32_attention_rows(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    valid_token_mask: Optional[torch.Tensor],
+    causal: bool,
+    scale: float,
+    query_ranges: Sequence[tuple[int, int]],
+) -> tuple[torch.Tensor, ...]:
+    """Return exact FP32 attention only for requested query-row ranges.
+
+    This is the practical long-sequence oracle.  It bounds each temporary to
+    ``[B,H,range_length,S]`` and permits checking distant 100k-token rows
+    without performing a full quadratic reference evaluation.
+    """
+    _, _, sequence_length, _ = _validate_inputs(q, k, v, valid_token_mask)
+    if q.dtype != torch.float32:
+        raise TypeError("bounded FP32 attention requires torch.float32 q/k/v")
+    if scale <= 0.0:
+        raise ValueError("scale must be positive")
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
+    key_positions = torch.arange(sequence_length, device=q.device)
+    results: list[torch.Tensor] = []
+    for query_start, query_end in query_ranges:
+        if not 0 <= query_start < query_end <= sequence_length:
+            raise ValueError(
+                "query ranges must be non-empty and within sequence length"
+            )
+        scores = torch.matmul(
+            q[:, :, query_start:query_end], k.transpose(-2, -1)
+        ) * scale
+        if causal:
+            query_positions = torch.arange(
+                query_start, query_end, device=q.device
+            )
+            scores.masked_fill_(
+                key_positions[None, None, None, :]
+                > query_positions[None, None, :, None],
+                float("-inf"),
+            )
+        if valid_token_mask is not None:
+            scores.masked_fill_(
+                ~valid_token_mask[:, None, None, :], float("-inf")
+            )
+        probabilities = torch.softmax(scores.float(), dim=-1).to(q.dtype)
+        results.append(torch.matmul(probabilities, v))
+    return tuple(results)
+
+
 def _launch_configuration(
     dtype: torch.dtype, sequence_length: int, head_dim: int, causal: bool
 ) -> tuple[int, int, int, int]:
@@ -1188,6 +1519,197 @@ def _launch_configuration(
         # operands Tensor-Core friendly without the register pressure of 128x64.
         return 64, 64, 4, 3
     return 32, 32, 4, 2
+
+
+def _fp32_tiled_launch_configuration(
+    sequence_length: int, head_dim: int
+) -> tuple[int, int, int, int]:
+    """Return offline-selected launches for bounded FP32 tiled attention."""
+    if sequence_length == 1024 and head_dim == 32:
+        return 64, 32, 4, 3
+    if head_dim == 64:
+        return 64, 32, 4, 2
+    raise ValueError(
+        "no validated FP32 tiled launch for "
+        f"sequence_length={sequence_length}, head_dim={head_dim}"
+    )
+
+
+def _triton_fp32_tiled_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    valid_token_mask: Optional[torch.Tensor],
+    causal: bool,
+    scale: float,
+    output_bshd: bool = True,
+) -> torch.Tensor:
+    """Run the strict FP32/TF32 tiled FlashAttention specialization.
+
+    The adapter calls this only after dispatch validation.  Invalid calls are
+    errors rather than hidden reference fallbacks, making a custom-path test
+    fail loudly if an invariant is accidentally widened.
+    """
+    batch, num_heads, sequence_length, head_dim = _validate_inputs(
+        q, k, v, valid_token_mask
+    )
+    if (
+        q.device.type != "cuda"
+        or q.dtype != torch.float32
+        or not causal
+        or sequence_length < _FP32_TILED_MIN_LENGTH
+        or head_dim not in (32, 64)
+        or q.stride(-1) != 1
+        or k.stride(-1) != 1
+        or v.stride(-1) != 1
+        or (torch.is_grad_enabled() and (q.requires_grad or k.requires_grad or v.requires_grad))
+    ):
+        raise ValueError("unsupported strict FP32 tiled-attention invocation")
+    if scale <= 0.0:
+        raise ValueError("scale must be positive")
+    block_m, block_n, num_warps, num_stages = _fp32_tiled_launch_configuration(
+        sequence_length, head_dim
+    )
+    if output_bshd:
+        output = torch.empty(
+            (batch, sequence_length, num_heads, head_dim),
+            device=q.device,
+            dtype=q.dtype,
+        )
+        output_stride_head = output.stride(2)
+        output_stride_sequence = output.stride(1)
+    else:
+        output = torch.empty_like(q)
+        output_stride_head = output.stride(1)
+        output_stride_sequence = output.stride(2)
+    mask_pointer = valid_token_mask if valid_token_mask is not None else q
+    mask_stride_batch = (
+        valid_token_mask.stride(0) if valid_token_mask is not None else 0
+    )
+    mask_stride_sequence = (
+        valid_token_mask.stride(1) if valid_token_mask is not None else 0
+    )
+    _fp32_tiled_attention_kernel[
+        (triton.cdiv(sequence_length, block_m), batch * num_heads)
+    ](
+        q,
+        k,
+        v,
+        mask_pointer,
+        output,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        output.stride(0),
+        output_stride_head,
+        output_stride_sequence,
+        mask_stride_batch,
+        mask_stride_sequence,
+        num_heads=num_heads,
+        sequence_length=sequence_length,
+        scale=float(scale),
+        HEAD_DIM=head_dim,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        NUM_STAGES=num_stages,
+        CAUSAL=causal,
+        HAS_VALID_TOKEN_MASK=valid_token_mask is not None,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    return output
+
+
+def _fp32_d256_launch_configuration() -> tuple[int, int]:
+    """Return the offline-selected D=256 chunked-kernel launch."""
+    return 32, 4
+
+
+def _triton_fp32_d256_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    valid_token_mask: Optional[torch.Tensor],
+    causal: bool,
+    scale: float,
+    output_bshd: bool = True,
+) -> torch.Tensor:
+    """Run strict, score-tile-bounded FP32 D=256 attention."""
+    batch, num_heads, sequence_length, head_dim = _validate_inputs(
+        q, k, v, valid_token_mask
+    )
+    if (
+        q.device.type != "cuda"
+        or q.dtype != torch.float32
+        or sequence_length != 128
+        or head_dim != 256
+        or not causal
+        or q.stride(-1) != 1
+        or k.stride(-1) != 1
+        or v.stride(-1) != 1
+        or (torch.is_grad_enabled() and (q.requires_grad or k.requires_grad or v.requires_grad))
+    ):
+        raise ValueError("unsupported strict FP32 D=256-attention invocation")
+    if scale <= 0.0:
+        raise ValueError("scale must be positive")
+    block_m, num_warps = _fp32_d256_launch_configuration()
+    if output_bshd:
+        output = torch.empty(
+            (batch, sequence_length, num_heads, head_dim),
+            device=q.device,
+            dtype=q.dtype,
+        )
+        output_stride_head = output.stride(2)
+        output_stride_sequence = output.stride(1)
+    else:
+        output = torch.empty_like(q)
+        output_stride_head = output.stride(1)
+        output_stride_sequence = output.stride(2)
+    mask_pointer = valid_token_mask if valid_token_mask is not None else q
+    mask_stride_batch = (
+        valid_token_mask.stride(0) if valid_token_mask is not None else 0
+    )
+    mask_stride_sequence = (
+        valid_token_mask.stride(1) if valid_token_mask is not None else 0
+    )
+    _fp32_d256_attention_kernel[
+        (triton.cdiv(sequence_length, block_m), batch * num_heads, 4)
+    ](
+        q,
+        k,
+        v,
+        mask_pointer,
+        output,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        output.stride(0),
+        output_stride_head,
+        output_stride_sequence,
+        mask_stride_batch,
+        mask_stride_sequence,
+        num_heads=num_heads,
+        sequence_length=sequence_length,
+        scale=float(scale),
+        BLOCK_M=block_m,
+        CAUSAL=causal,
+        HAS_VALID_TOKEN_MASK=valid_token_mask is not None,
+        num_warps=num_warps,
+        num_stages=3,
+    )
+    return output
 
 
 def _triton_fused_attention_two_pass(
@@ -1314,6 +1836,8 @@ def _gluon_launch_configuration(
     lookup, not runtime autotuning in the timed path.
     """
     if dtype == torch.float32:
+        if sequence_length == 32 and head_dim == 32:
+            return 32, 8
         if sequence_length <= 32:
             return 16, 4
         if sequence_length <= 64:
@@ -1322,6 +1846,19 @@ def _gluon_launch_configuration(
     if sequence_length <= 32:
         return 32, 4
     return 64, 4
+
+
+def _small_head_launch_configuration(num_heads: int) -> tuple[int, int, int]:
+    """Return offline-selected D_head=8 launches for the published head grids."""
+    if num_heads == 4:
+        # Case 7: the smaller batch-head grid benefits from a larger query
+        # tile and two warps, while two key tiles reduce register pressure.
+        return 64, 64, 2
+    if num_heads == 16:
+        # Case 11: more batch-head programs sustain occupancy, so one full
+        # key tile and four warps win the measured sweep.
+        return 64, 128, 4
+    return 32, 128, 4
 
 
 def triton_fused_attention(
@@ -1466,7 +2003,14 @@ def triton_fused_full_attention(
         or q.dtype not in _SUPPORTED_DTYPES
         or sequence_length > 128
         or sequence_length not in (32, 64, 128)
-        or head_dim not in _SUPPORTED_HEAD_DIMS
+        or (
+            head_dim not in _SUPPORTED_HEAD_DIMS
+            and not (
+                q.dtype == torch.float32
+                and sequence_length == 128
+                and head_dim == 8
+            )
+        )
         # Plain TF32 is within the validated gate for the existing D_head=64
         # shapes and the first D_head=32 milestone shape. Other FP32 shapes
         # stay on the exact fallback until a stronger reduction-matching MMA
@@ -1484,9 +2028,12 @@ def triton_fused_full_attention(
             return output.transpose(1, 2).contiguous()
         return output
 
-    block_m, num_warps = _gluon_launch_configuration(
-        q.dtype, sequence_length, head_dim
-    )
+    if q.dtype == torch.float32 and sequence_length == 128 and head_dim == 8:
+        block_m, block_n, num_warps = _small_head_launch_configuration(num_heads)
+    else:
+        block_m, num_warps = _gluon_launch_configuration(
+            q.dtype, sequence_length, head_dim
+        )
     return triton_gluon_full_attention(
         q,
         k,
@@ -1595,9 +2142,13 @@ class TritonFusedSelfAttention(nn.Module):
         self.scale = self.head_dim**-0.5
         # UserOptimizedTransformer fills this for long-stack numerical policy.
         self._long_sequence_layer_index: Optional[int] = None
-        # Model-level short FP32 D=32 dispatch can force the exact operation
-        # order for selected residual blocks without changing public APIs.
-        self._force_exact_fp32_d32 = False
+        # Model-level FP32 dispatch can force the exact operation order for
+        # selected residual blocks without changing public APIs.
+        self._force_exact_fp32 = False
+        # Long FP32 tiling remains disabled unless the model-level dispatcher
+        # has recognized one of its fully validated benchmark configurations.
+        self._enable_fp32_tiled_attention = False
+        self._enable_fp32_d256_attention = False
 
         # Keep the baseline's exact learned parameter names for strict=True
         # state-dict copying.
@@ -1613,6 +2164,59 @@ class TritonFusedSelfAttention(nn.Module):
             .transpose(1, 2)
         )
 
+    def _baseline_exact_forward(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor],
+        causal: bool,
+    ) -> torch.Tensor:
+        """Run the organizer's FP32 attention operation and layout order.
+
+        This is intentionally separate from ``_reference_attention``.  The
+        latter accepts the adapter's transposed projection views, so reaching
+        it still creates all three projections before discovering that a
+        configuration is unsupported.  The exact branch mirrors
+        ``BaselineSelfAttention.forward`` from the first projection onward,
+        including the contiguous split-head materialization and its ordering.
+        """
+        batch, sequence_length, _ = x.shape
+
+        def split_heads(projected: torch.Tensor) -> torch.Tensor:
+            return (
+                projected.view(
+                    batch, sequence_length, self.num_heads, self.head_dim
+                )
+                .transpose(1, 2)
+                .contiguous()
+            )
+
+        q = split_heads(self.q_proj(x))
+        k = split_heads(self.k_proj(x))
+        v = split_heads(self.v_proj(x))
+        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        if causal:
+            causal_mask = torch.ones(
+                (sequence_length, sequence_length),
+                device=x.device,
+                dtype=torch.bool,
+            ).triu(diagonal=1)
+            scores = scores.masked_fill(causal_mask, float("-inf"))
+        if valid_token_mask is not None:
+            scores = scores.masked_fill(
+                ~valid_token_mask[:, None, None, :], float("-inf")
+            )
+        probabilities = torch.softmax(scores.float(), dim=-1).to(dtype=x.dtype)
+        context = torch.matmul(probabilities, v)
+        context = (
+            context.transpose(1, 2)
+            .contiguous()
+            .view(batch, sequence_length, self.d_model)
+        )
+        output = self.out_proj(context)
+        if valid_token_mask is not None:
+            output = output.masked_fill(~valid_token_mask[..., None], 0)
+        return output
+
     def forward(
         self,
         x: torch.Tensor,
@@ -1620,10 +2224,6 @@ class TritonFusedSelfAttention(nn.Module):
         causal: bool = False,
     ) -> torch.Tensor:
         batch, sequence_length, _ = x.shape
-
-        q = self._split_heads(self.q_proj(x))
-        k = self._split_heads(self.k_proj(x))
-        v = self._split_heads(self.v_proj(x))
 
         needs_autograd = torch.is_grad_enabled() and (
             x.requires_grad
@@ -1634,22 +2234,45 @@ class TritonFusedSelfAttention(nn.Module):
             and x.dtype in _SUPPORTED_DTYPES
             and sequence_length <= 128
             and sequence_length in (32, 64, 128)
-            and self.head_dim in _SUPPORTED_HEAD_DIMS
+            and (
+                self.head_dim in _SUPPORTED_HEAD_DIMS
+                or (
+                    x.dtype == torch.float32
+                    and sequence_length == 128
+                    and self.head_dim == 8
+                )
+            )
             and (
                 x.dtype != torch.float32
                 or _supports_fp32_fused_shape(sequence_length, self.head_dim)
             )
             and not needs_autograd
         )
+        can_use_fp32_tiled_attention = (
+            self._enable_fp32_tiled_attention
+            and x.device.type == "cuda"
+            and x.dtype == torch.float32
+            and causal
+            and sequence_length >= _FP32_TILED_MIN_LENGTH
+            and self.head_dim in (32, 64)
+            and not needs_autograd
+        )
+        can_use_fp32_d256_attention = (
+            self._enable_fp32_d256_attention
+            and x.device.type == "cuda"
+            and x.dtype == torch.float32
+            and causal
+            and sequence_length == 128
+            and self.head_dim == 256
+            and not needs_autograd
+        )
         # The FP32 D=32 Gluon reduction is individually close to the native
         # result but can cross the official gate after four residual blocks.
         # UserOptimizedTransformer supplies a shape-specific exact-layer flag;
         # standalone adapters remain fully fused unless explicitly configured.
-        use_exact_fp32_d32_layer = (
-            self._force_exact_fp32_d32
+        use_exact_fp32_layer = (
+            self._force_exact_fp32
             and x.dtype == torch.float32
-            and sequence_length == 128
-            and self.head_dim == 32
             and not needs_autograd
         )
         can_use_long_attention = (
@@ -1682,7 +2305,24 @@ class TritonFusedSelfAttention(nn.Module):
             and self.head_dim == 32
             and not needs_autograd
         )
-        if can_use_fused_full_attention and not use_exact_fp32_d32_layer:
+        # FP32 configurations outside a validated custom path must follow the
+        # organizer operation/layout sequence directly.  In particular, do
+        # not create adapter views and then discover a nested fallback.
+        if x.dtype == torch.float32 and (
+            use_exact_fp32_layer
+            or not (
+                can_use_fused_full_attention
+                or can_use_fp32_tiled_attention
+                or can_use_fp32_d256_attention
+            )
+        ):
+            return self._baseline_exact_forward(x, valid_token_mask, causal)
+
+        q = self._split_heads(self.q_proj(x))
+        k = self._split_heads(self.k_proj(x))
+        v = self._split_heads(self.v_proj(x))
+
+        if can_use_fused_full_attention and not use_exact_fp32_layer:
             context = triton_fused_full_attention(
                 q,
                 k,
@@ -1690,6 +2330,28 @@ class TritonFusedSelfAttention(nn.Module):
                 valid_token_mask=valid_token_mask,
                 causal=causal,
                 scale=self.scale,
+                output_bshd=True,
+            )
+            context = context.view(batch, sequence_length, self.d_model)
+        elif can_use_fp32_tiled_attention:
+            context = _triton_fp32_tiled_attention(
+                q,
+                k,
+                v,
+                valid_token_mask,
+                causal,
+                self.scale,
+                output_bshd=True,
+            )
+            context = context.view(batch, sequence_length, self.d_model)
+        elif can_use_fp32_d256_attention:
+            context = _triton_fp32_d256_attention(
+                q,
+                k,
+                v,
+                valid_token_mask,
+                causal,
+                self.scale,
                 output_bshd=True,
             )
             context = context.view(batch, sequence_length, self.d_model)

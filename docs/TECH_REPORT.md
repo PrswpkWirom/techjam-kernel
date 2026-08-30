@@ -508,3 +508,107 @@ with a smaller independent P@V contribution; no launch tuning was needed.
 
 Case 13 is the next milestone: extend the FP32 tiled attention core only
 after this case-6 policy is retained by the full review and commit gates.
+
+## FP32 completion: published cases 7–14
+
+Date: 2026-08-30
+
+Environment: NVIDIA GeForce RTX 5070 Ti (sm120, 16,603,101,504 bytes),
+PyTorch 2.13.0+cu130, Triton 3.7.1, CUDA 13.0.  Codex used the approved
+implementation/TDD workflow to add dispatch tests before each kernel path,
+then recorded rejected configurations rather than routing them silently.
+
+### Dispatch and numerical policy
+
+Unsupported FP32 attention now enters a baseline-operation-order branch before
+adapter Q/K/V views are created.  This branch matches the organizer's
+projection order, contiguous split-head layout, masking, FP32 softmax, P@V,
+and output projection.  It fixes the previous nested-fallback regression and
+remains the deliberate path for cases 8 and 9.
+
+The selected FP32 specializations are deliberately separate:
+
+- Case 12 extends the full-row Gluon whitelist to `(S=32,D_head=32)`. `FFFF`
+  failed one of 20 trials; `EFFF` passed 100 unpadded and 20 padded trials.
+  The selected launch is `BLOCK_M=32`, `BLOCK_N=32`, eight warps.
+- Case 9 structurally compiled at `(128,128)`, but `FFFF` failed accuracy and
+  the passing `FFEF` candidate measured 0.858x.  Its whitelist was removed
+  and the final policy is exact `EEEE`.
+- Cases 7 and 11 use a dedicated D_head=8 Gluon kernel. Q/K and V are padded
+  to 16 lanes for TF32 MMA, while only eight output lanes are stored. It keeps
+  FP32 online-softmax state and supports both 64- and 128-key tiles. Case 7
+  selects `EFFF`, `64x64`, two warps; case 11 selects `FFFF`, `64x128`, four
+  warps.
+- Case 13 uses a dedicated FP32 tiled FlashAttention kernel: TF32 QK/PV MMA,
+  FP32 scores, `m/l/acc` online-softmax state, direct BSHD output, causal and
+  padding masks, and no global score/probability tensor. Its selected launch
+  is `64x32`, four warps, three stages, and it passes as `FFFF`.
+- Case 8's D=256 experiment accumulates QK over four D=64 TF32 chunks,
+  normalizes once, then computes four D=64 PV chunks. It was correct in some
+  short sweeps but failed 100-seed residual-stack certification even after a
+  hybrid policy and offered no stable speed margin. The final policy is exact
+  `EEEE`; the strict experimental kernel is not dispatched.
+- Case 14 reuses the tiled core at D_head=64 with `64x32`, four warps, two
+  stages. A bounded FP32 PyTorch oracle processes small query blocks and was
+  checked against dense attention at manageable lengths and against beginning,
+  middle, and mask-boundary rows at S=100000. The model-level B=1 probe
+  passes two-layer dense-reference validation at S=1024 and full 100k finite/
+  padding smoke tests.
+
+The FP32 100k B=32 output contract cannot be executed on this 16 GB GPU:
+input plus output alone require 24.41 GiB before model working state. The
+smoke tool therefore preflights the full FP32 shape and requires a >=32 GiB
+GPU. The protected baseline also cannot be timed at this shape because its
+single FP32 score tensor requires 20.48 TB. No official case-14 speedup is
+claimed.
+
+### Final validation
+
+The protected evaluator passed before and after every matrix run. Full tests:
+
+```bash
+.venv/bin/python -m unittest discover -v
+.venv/bin/python -m py_compile torch_transformer_benchmark.py \
+  model/triton_fused_attention.py model/triton_gluon_attention.py \
+  tools/smoke_long_sequence.py test/test_triton_fused_attention.py
+python3 tools/check_benchmark_integrity.py
+```
+
+The final first run covered cases 1–13; the independent second timing run
+covered changed cases 7–13 plus the restored case-10 policy. Both used 20
+accuracy trials, 20 warmups, 100 repeats, and 10 alternating rounds:
+
+```bash
+.venv/bin/python tools/run_benchmark_matrix.py \
+  --case 1,2,3,4,5,6,7,8,9,10,11,12,13 --device cuda --dtype float32 \
+  --accuracy-trials 20 --warmup 20 --repeats 100 --benchmark-rounds 10
+.venv/bin/python tools/run_benchmark_matrix.py \
+  --case 7,8,9,10,11,12,13 --device cuda --dtype float32 \
+  --accuracy-trials 20 --warmup 20 --repeats 100 --benchmark-rounds 10
+.venv/bin/python tools/smoke_long_sequence.py --dtype float32 \
+  --batch-size 1 --padding-ratio 0.0 --warmup 1 --repeats 3
+```
+
+Cases 7–13 also passed 100 unpadded deterministic seeds and 20 seeds with
+`padding_ratio=0.25`; rejected exact paths were included in the padded matrix.
+The B=1 case-14 smoke had samples `1279.576, 1277.771, 1281.343 ms`, median
+`1279.576 ms`, peak allocated `3595.9 MiB`, peak reserved `3622.0 MiB`, finite
+FP32 output, and zero padded-query outputs. A separate 25%-padding 100k run
+also passed.
+
+| case | shape (B,S,D,H) | FP32 dispatch / policy | kernel family | correctness | baseline median | optimized median | speedup | limitation |
+|---:|---|---|---|---|---:|---:|---:|---|
+| 1 | 64,128,128,4 | EFFF | Gluon full-row D32 | PASS | 1.5267 ms | 1.0191 ms | 1.498x | — |
+| 2 | 1,128,128,4 | EFFF | Gluon full-row D32 | PASS | 1.1080 ms | 1.0391 ms | 1.066x | — |
+| 3 | 4,128,128,4 | EFFF | Gluon full-row D32 | PASS | 1.0175 ms | 0.9621 ms | 1.058x | — |
+| 4 | 16,128,128,4 | EFFF | Gluon full-row D32 | PASS | 1.0790 ms | 1.0170 ms | 1.061x | — |
+| 5 | 128,128,128,4 | EFFF | Gluon full-row D32 | PASS | 3.0199 ms | 2.0498 ms | 1.473x | — |
+| 6 | 10000,128,128,4 | EEFF | Gluon full-row D32 | PASS | 408.9762 ms | 294.5715 ms | 1.388x | — |
+| 7 | 64,128,32,4 | EFFF | padded-TF32 Gluon D8 | PASS | 0.9686 ms | 0.9577 ms | 1.011x | narrow margin, retained after two runs |
+| 8 | 64,128,1024,4 | EEEE | early exact | PASS | 16.7618 ms | 16.7836 ms | 0.999x | D256 custom candidate rejected |
+| 9 | 64,128,128,1 | EEEE | early exact | PASS | 0.8946 ms | 0.8946 ms | 1.000x | D128 Gluon candidate rejected |
+| 10 | 64,128,128,2 | FFFF | Gluon full-row D64 | PASS | 1.1833 ms | 0.8221 ms | 1.439x | — |
+| 11 | 64,128,128,16 | FFFF | padded-TF32 Gluon D8 | PASS | 6.5712 ms | 1.0407 ms | 6.314x | — |
+| 12 | 64,32,128,4 | EFFF | Gluon full-row D32 | PASS | 1.0363 ms | 0.9749 ms | 1.063x | — |
+| 13 | 64,1024,128,4 | FFFF | tiled FP32 TF32 MMA | PASS | 99.3595 ms | 8.3001 ms | 11.971x | — |
+| 14 | 32,100000,1024,16 | FF (B=1 validated) | tiled FP32 TF32 MMA | bounded-oracle PASS | N/A | N/A (B=32) | N/A | requires >=32 GiB; dense baseline infeasible |

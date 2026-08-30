@@ -167,6 +167,34 @@ class TritonFusedAttentionTests(unittest.TestCase):
                 self.assertEqual(output.shape, x.shape)
                 self.assertEqual(output.dtype, dtype)
 
+    def test_unsupported_fp32_adapter_uses_early_baseline_path(self) -> None:
+        """Unsupported FP32 heads must not pay for nested adapter fallback."""
+        from torch_transformer_benchmark import BaselineSelfAttention
+
+        torch.manual_seed(7021)
+        baseline = BaselineSelfAttention(d_model=48, num_heads=4).cuda().float().eval()
+        candidate = TritonFusedSelfAttention(d_model=48, num_heads=4)
+        candidate.load_state_dict(baseline.state_dict(), strict=True)
+        candidate = candidate.cuda().float().eval()
+        x = torch.randn((2, 128, 48), device="cuda", dtype=torch.float32)
+        mask = torch.arange(128, device="cuda")[None, :] < torch.tensor(
+            [128, 71], device="cuda"
+        )[:, None]
+
+        with torch.inference_mode():
+            expected = baseline(x, mask, causal=True)
+        with mock.patch(
+            "model.triton_fused_attention._reference_attention",
+            side_effect=AssertionError("nested fallback must not run"),
+        ), mock.patch(
+            "model.triton_fused_attention.triton_fused_full_attention",
+            side_effect=AssertionError("unsupported path must not enter Gluon"),
+        ):
+            with torch.inference_mode():
+                actual = candidate(x, mask, causal=True)
+
+        self.assertTrue(torch.equal(actual, expected))
+
     def test_fp32_d32_case1_uses_hybrid_dispatch_and_passes_gate(self) -> None:
         """D=32 keeps the first stack block exact and fuses the remaining blocks."""
         from torch_transformer_benchmark import (
@@ -203,15 +231,13 @@ class TritonFusedAttentionTests(unittest.TestCase):
         with torch.inference_mode():
             expected = baseline(x, valid_token_mask)
 
-        from model.triton_fused_attention import (
-            _reference_attention as reference_attention,
-        )
         with mock.patch(
             "model.triton_fused_attention.triton_fused_full_attention",
             wraps=triton_fused_full_attention,
         ) as fused, mock.patch(
-            "model.triton_fused_attention._reference_attention",
-            wraps=reference_attention,
+            "model.triton_fused_attention.TritonFusedSelfAttention._baseline_exact_forward",
+            autospec=True,
+            wraps=TritonFusedSelfAttention._baseline_exact_forward,
         ) as exact:
             with torch.inference_mode():
                 actual = candidate(x, valid_token_mask)
@@ -271,9 +297,6 @@ class TritonFusedAttentionTests(unittest.TestCase):
         del baseline
         torch.cuda.empty_cache()
 
-        from model.triton_fused_attention import (
-            _reference_attention as reference_attention,
-        )
         from model.triton_gluon_attention import (
             triton_gluon_full_attention as gluon_full_attention,
         )
@@ -290,8 +313,9 @@ class TritonFusedAttentionTests(unittest.TestCase):
             "model.triton_fused_attention.triton_fused_full_attention",
             wraps=triton_fused_full_attention,
         ) as fused, mock.patch(
-            "model.triton_fused_attention._reference_attention",
-            wraps=reference_attention,
+            "model.triton_fused_attention.TritonFusedSelfAttention._baseline_exact_forward",
+            autospec=True,
+            wraps=TritonFusedSelfAttention._baseline_exact_forward,
         ) as exact, mock.patch(
             "model.triton_fused_attention.triton_gluon_full_attention",
             side_effect=guarded_gluon,
@@ -308,6 +332,324 @@ class TritonFusedAttentionTests(unittest.TestCase):
         _assert_official_tolerance(actual_cpu, expected)
         del actual, actual_cpu, expected, candidate, x, valid_token_mask
         torch.cuda.empty_cache()
+
+    def test_fp32_case12_uses_efff_gluon_path(self) -> None:
+        """Case 12 keeps its first residual block exact and fuses three."""
+        from torch_transformer_benchmark import (
+            BaselineTransformer,
+            TransformerConfig,
+            UserOptimizedTransformer,
+            copy_model_weights,
+            generate_random_case,
+        )
+
+        config = TransformerConfig(64, 32, 128, 4, 128, 4, True)
+        torch.manual_seed(12012)
+        baseline = BaselineTransformer(config).cuda().float().eval()
+        candidate = UserOptimizedTransformer(config).cuda().float().eval()
+        copy_model_weights(baseline, candidate)
+        x, mask = generate_random_case(
+            config, torch.device("cuda"), torch.float32, 12012, 0.0, 1.0
+        )
+        with torch.inference_mode():
+            expected = baseline(x, mask)
+
+        from model.triton_gluon_attention import (
+            triton_gluon_full_attention as gluon_full_attention,
+        )
+
+        def guarded_gluon(*args: object, **kwargs: object) -> torch.Tensor:
+            with mock.patch(
+                "model.triton_gluon_attention.torch.matmul",
+                side_effect=AssertionError("case 12 Gluon path fell back"),
+            ):
+                return gluon_full_attention(*args, **kwargs)
+
+        with mock.patch(
+            "model.triton_fused_attention.triton_fused_full_attention",
+            wraps=triton_fused_full_attention,
+        ) as fused, mock.patch(
+            "model.triton_fused_attention.TritonFusedSelfAttention._baseline_exact_forward",
+            autospec=True,
+            wraps=TritonFusedSelfAttention._baseline_exact_forward,
+        ) as exact, mock.patch(
+            "model.triton_fused_attention.triton_gluon_full_attention",
+            side_effect=guarded_gluon,
+        ):
+            with torch.inference_mode():
+                actual = candidate(x, mask)
+
+        self.assertEqual(fused.call_count, 3)
+        self.assertEqual(exact.call_count, 1)
+        _assert_official_tolerance(actual, expected)
+
+    def test_fp32_case9_rejects_slower_gluon_candidate_for_exact_path(self) -> None:
+        """Case 9 retains exact attention despite a structurally valid kernel."""
+        from torch_transformer_benchmark import (
+            BaselineTransformer,
+            TransformerConfig,
+            UserOptimizedTransformer,
+            copy_model_weights,
+            generate_random_case,
+        )
+
+        config = TransformerConfig(64, 128, 128, 1, 128, 4, True)
+        torch.manual_seed(9009)
+        baseline = BaselineTransformer(config).cuda().float().eval()
+        candidate = UserOptimizedTransformer(config).cuda().float().eval()
+        copy_model_weights(baseline, candidate)
+        x, mask = generate_random_case(
+            config, torch.device("cuda"), torch.float32, 9009, 0.0, 1.0
+        )
+        with torch.inference_mode():
+            expected = baseline(x, mask)
+
+        with mock.patch(
+            "model.triton_fused_attention.triton_fused_full_attention",
+            side_effect=AssertionError("rejected case 9 kernel must not run"),
+        ) as fused, mock.patch(
+            "model.triton_fused_attention.TritonFusedSelfAttention._baseline_exact_forward",
+            autospec=True,
+            wraps=TritonFusedSelfAttention._baseline_exact_forward,
+        ) as exact:
+            with torch.inference_mode():
+                actual = candidate(x, mask)
+
+        self.assertEqual(fused.call_count, 0)
+        self.assertEqual(exact.call_count, 4)
+        self.assertTrue(torch.equal(actual, expected))
+
+    def test_fp32_case10_preserves_full_gluon_dispatch(self) -> None:
+        """The established D_head=64 case remains FFFF after policy changes."""
+        from torch_transformer_benchmark import (
+            BaselineTransformer,
+            TransformerConfig,
+            UserOptimizedTransformer,
+            copy_model_weights,
+        )
+
+        config = TransformerConfig(64, 128, 128, 2, 128, 4, True)
+        torch.manual_seed(10010)
+        baseline = BaselineTransformer(config).cuda().float().eval()
+        candidate = UserOptimizedTransformer(config).cuda().float().eval()
+        copy_model_weights(baseline, candidate)
+        x = torch.randn((64, 128, 128), device="cuda", dtype=torch.float32)
+        mask = torch.ones((64, 128), device="cuda", dtype=torch.bool)
+        with torch.inference_mode():
+            expected = baseline(x, mask)
+        with mock.patch(
+            "model.triton_fused_attention.triton_fused_full_attention",
+            wraps=triton_fused_full_attention,
+        ) as fused, mock.patch(
+            "model.triton_fused_attention.TritonFusedSelfAttention._baseline_exact_forward",
+            side_effect=AssertionError("case 10 must remain fully fused"),
+        ):
+            with torch.inference_mode():
+                actual = candidate(x, mask)
+        self.assertEqual(fused.call_count, 4)
+        _assert_official_tolerance(actual, expected)
+
+    def test_fp32_small_head_cases_enter_dedicated_gluon_path(self) -> None:
+        """Published D_head=8 cases must not fall back to D>=16 logic."""
+        from torch_transformer_benchmark import (
+            BaselineTransformer,
+            TransformerConfig,
+            UserOptimizedTransformer,
+            copy_model_weights,
+            generate_random_case,
+        )
+        from model.triton_gluon_attention import triton_gluon_small_head_attention
+
+        configs = (
+            (TransformerConfig(64, 128, 32, 4, 32, 4, True), 3, 1),
+            (TransformerConfig(64, 128, 128, 16, 128, 4, True), 4, 0),
+        )
+        for config, expected_small_head, expected_exact in configs:
+            with self.subTest(d_model=config.d_model, heads=config.num_heads):
+                torch.manual_seed(7000 + config.d_model)
+                baseline = BaselineTransformer(config).cuda().float().eval()
+                candidate = UserOptimizedTransformer(config).cuda().float().eval()
+                copy_model_weights(baseline, candidate)
+                x, mask = generate_random_case(
+                    config,
+                    torch.device("cuda"),
+                    torch.float32,
+                    7000 + config.d_model,
+                    0.0,
+                    1.0,
+                )
+                with torch.inference_mode():
+                    expected = baseline(x, mask)
+                with mock.patch(
+                    "model.triton_gluon_attention.triton_gluon_small_head_attention",
+                    wraps=triton_gluon_small_head_attention,
+                ) as small_head, mock.patch(
+                    "model.triton_fused_attention.TritonFusedSelfAttention._baseline_exact_forward",
+                    autospec=True,
+                    wraps=TritonFusedSelfAttention._baseline_exact_forward,
+                ) as exact:
+                    with torch.inference_mode():
+                        actual = candidate(x, mask)
+                self.assertEqual(small_head.call_count, expected_small_head)
+                self.assertEqual(exact.call_count, expected_exact)
+                _assert_official_tolerance(actual, expected)
+
+    def test_fp32_case13_enters_tiled_attention_without_dense_fallback(self) -> None:
+        """Case 13 must use four bounded FP32 tiled attention calls."""
+        from torch_transformer_benchmark import (
+            BaselineTransformer,
+            TransformerConfig,
+            UserOptimizedTransformer,
+            copy_model_weights,
+            generate_random_case,
+        )
+        from model.triton_fused_attention import _triton_fp32_tiled_attention
+
+        config = TransformerConfig(64, 1024, 128, 4, 128, 4, True)
+        torch.manual_seed(13133)
+        baseline = BaselineTransformer(config).cuda().float().eval()
+        candidate = UserOptimizedTransformer(config).cuda().float().eval()
+        copy_model_weights(baseline, candidate)
+        x, mask = generate_random_case(
+            config, torch.device("cuda"), torch.float32, 13133, 0.0, 1.0
+        )
+        with torch.inference_mode():
+            expected = baseline(x, mask)
+        with mock.patch(
+            "model.triton_fused_attention._triton_fp32_tiled_attention",
+            wraps=_triton_fp32_tiled_attention,
+        ) as tiled, mock.patch(
+            "model.triton_fused_attention.TritonFusedSelfAttention._baseline_exact_forward",
+            side_effect=AssertionError("case 13 must not enter dense exact attention"),
+        ), mock.patch(
+            "model.triton_fused_attention._reference_attention",
+            side_effect=AssertionError("case 13 must not use nested fallback"),
+        ):
+            with torch.inference_mode():
+                actual = candidate(x, mask)
+        self.assertEqual(tiled.call_count, 4)
+        _assert_official_tolerance(actual, expected)
+
+    def test_fp32_case8_rejects_chunked_d256_attention_for_exact_path(self) -> None:
+        """Case 8 keeps the exact path when chunked fusion is not retained."""
+        from torch_transformer_benchmark import (
+            BaselineTransformer,
+            TransformerConfig,
+            UserOptimizedTransformer,
+            copy_model_weights,
+            generate_random_case,
+        )
+        config = TransformerConfig(64, 128, 1024, 4, 1024, 4, True)
+        torch.manual_seed(8008)
+        baseline = BaselineTransformer(config).cuda().float().eval()
+        candidate = UserOptimizedTransformer(config).cuda().float().eval()
+        copy_model_weights(baseline, candidate)
+        x, mask = generate_random_case(
+            config, torch.device("cuda"), torch.float32, 8008, 0.0, 1.0
+        )
+        with torch.inference_mode():
+            expected = baseline(x, mask)
+        with mock.patch(
+            "model.triton_fused_attention._triton_fp32_d256_attention",
+            side_effect=AssertionError("rejected D=256 kernel must not run"),
+        ) as chunked, mock.patch(
+            "model.triton_fused_attention.TritonFusedSelfAttention._baseline_exact_forward",
+            autospec=True,
+            wraps=TritonFusedSelfAttention._baseline_exact_forward,
+        ) as exact:
+            with torch.inference_mode():
+                actual = candidate(x, mask)
+        self.assertEqual(chunked.call_count, 0)
+        self.assertEqual(exact.call_count, 4)
+        self.assertTrue(torch.equal(actual, expected))
+
+    def test_fp32_tiled_d64_matches_bounded_reference_with_padding(self) -> None:
+        """The generalized long FP32 kernel matches the bounded oracle."""
+        from model.triton_fused_attention import (
+            _blocked_fp32_attention,
+            _triton_fp32_tiled_attention,
+        )
+
+        torch.manual_seed(14640)
+        q = torch.randn((1, 2, 1024, 64), device="cuda", dtype=torch.float32)
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+        mask = torch.arange(1024, device="cuda")[None, :] < 783
+        with torch.inference_mode():
+            expected = _blocked_fp32_attention(
+                q, k, v, mask, causal=True, scale=64 ** -0.5
+            )
+            actual = _triton_fp32_tiled_attention(
+                q,
+                k,
+                v,
+                mask,
+                causal=True,
+                scale=64 ** -0.5,
+                output_bshd=True,
+            )
+        self.assertEqual(tuple(actual.shape), (1, 1024, 2, 64))
+        _assert_official_tolerance(actual, expected)
+
+    def test_fp32_tiled_d64_long_rows_match_bounded_oracle(self) -> None:
+        """Sampled beginning/middle/end rows certify the 100k FP32 kernel."""
+        from model.triton_fused_attention import (
+            _blocked_fp32_attention_rows,
+            _triton_fp32_tiled_attention,
+        )
+
+        sequence_length = 100_000
+        torch.manual_seed(14641)
+        q = torch.randn((1, 1, sequence_length, 64), device="cuda", dtype=torch.float32)
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+        mask = torch.arange(sequence_length, device="cuda")[None, :] < 75_000
+        ranges = ((0, 8), (49_996, 50_004), (74_992, 75_000))
+        with torch.inference_mode():
+            actual = _triton_fp32_tiled_attention(
+                q, k, v, mask, causal=True, scale=64 ** -0.5, output_bshd=False
+            )
+            expected_rows = _blocked_fp32_attention_rows(
+                q, k, v, mask, causal=True, scale=64 ** -0.5, query_ranges=ranges
+            )
+        for (start, end), expected in zip(ranges, expected_rows):
+            with self.subTest(query_range=(start, end)):
+                _assert_official_tolerance(actual[:, :, start:end], expected)
+
+    def test_fp32_case14_shape_two_layer_model_matches_dense_baseline(self) -> None:
+        """The long D=64 model path agrees with dense attention at S=1024."""
+        from torch_transformer_benchmark import (
+            BaselineTransformer,
+            TransformerConfig,
+            UserOptimizedTransformer,
+            copy_model_weights,
+        )
+        from model.triton_fused_attention import _triton_fp32_tiled_attention
+
+        config = TransformerConfig(1, 1024, 1024, 16, 1024, 2, True)
+        torch.manual_seed(14642)
+        baseline = BaselineTransformer(config).cuda().float().eval()
+        candidate = UserOptimizedTransformer(config).cuda().float().eval()
+        copy_model_weights(baseline, candidate)
+        for layer in candidate.layers:
+            layer.attention._force_exact_fp32 = False
+            layer.attention._enable_fp32_tiled_attention = True
+        x = torch.randn((1, 1024, 1024), device="cuda", dtype=torch.float32)
+        mask = torch.arange(1024, device="cuda")[None, :] < 783
+        with torch.inference_mode():
+            expected = baseline(x, mask)
+        with mock.patch(
+            "model.triton_fused_attention._triton_fp32_tiled_attention",
+            wraps=_triton_fp32_tiled_attention,
+        ) as tiled, mock.patch(
+            "model.triton_fused_attention._reference_attention",
+            side_effect=AssertionError("long FP32 model must not use nested fallback"),
+        ):
+            with torch.inference_mode():
+                actual = candidate(x, mask)
+        self.assertEqual(tiled.call_count, 2)
+        _assert_official_tolerance(actual, expected)
+        self.assertTrue(bool((actual[~mask] == 0).all()))
 
     def test_full_attention_fallback_matches_contiguous_reference_all_dtypes(self) -> None:
         """Unsupported sequence lengths retain the baseline operation order."""
